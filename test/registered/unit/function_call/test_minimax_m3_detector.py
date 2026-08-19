@@ -1,5 +1,3 @@
-"""Unit tests for MinimaxM3Detector - no server, no model loading."""
-
 import json
 import unittest
 
@@ -97,12 +95,10 @@ def _make_tools():
                 parameters={
                     "type": "object",
                     "properties": {
-                        # plain string: enum-like values "none"/"nil" must survive
                         "mode": {
                             "type": "string",
                             "enum": ["none", "low", "high"],
                         },
-                        # nullable string: only "null" should coerce to None
                         "optional": {"type": ["string", "null"]},
                     },
                 },
@@ -112,17 +108,14 @@ def _make_tools():
 
 
 def _wire(*lines):
-    """Join wire lines, prefixing each with the MiniMax namespace token."""
     return "".join(NS + line for line in lines)
 
 
 def _segments(*lines):
-    """Return wire lines as separate chunks, each starting at a namespace token."""
     return [NS + line for line in lines]
 
 
 def _collect_streamed_tool_calls(all_calls):
-    """Accumulate streaming ToolCallItems (name + arg-JSON fragments) by tool_index."""
     tools = {}
     for c in all_calls:
         idx = c.tool_index
@@ -137,7 +130,6 @@ def _collect_streamed_tool_calls(all_calls):
 
 
 def _stream_segments(segments, tools):
-    """Feed segments chunk-by-chunk; return list of {name, args} dicts."""
     detector = MinimaxM3Detector()
     all_calls = []
     for seg in _segments(*segments):
@@ -147,7 +139,6 @@ def _stream_segments(segments, tools):
 
 
 def _parse_segments(segments, tools):
-    """Run non-streaming detect_and_parse over the joined segments."""
     detector = MinimaxM3Detector()
     result = detector.detect_and_parse(_wire(*segments), tools)
     return [
@@ -333,8 +324,6 @@ class TestMinimaxM3DetectAndParse(CustomTestCase):
 
 
 class TestMinimaxM3NoneNullRegression(CustomTestCase):
-    """Regression guard for Fix 1 / Fix 2: string values must not null-coerce."""
-
     def setUp(self):
         self.tools = _make_tools()
 
@@ -408,7 +397,6 @@ class TestMinimaxM3Streaming(CustomTestCase):
         self.assertEqual(calls[0]["args"], {"city": "Beijing"})
 
     def test_streaming_matches_non_streaming(self):
-        """Feed wire split on namespace token; must equal one-shot parse."""
         cases = {
             "weather": (
                 "<tool_call>",
@@ -504,7 +492,6 @@ class TestMinimaxM3Malformed(CustomTestCase):
         self.tools = _make_tools()
 
     def test_truncated_no_closing_tags(self):
-        # tool_call opened but never closed: returned verbatim as normal_text.
         text = _wire(
             "<tool_call>",
             '<invoke name="get_weather">',
@@ -516,7 +503,6 @@ class TestMinimaxM3Malformed(CustomTestCase):
         self.assertEqual(result.normal_text, text)
 
     def test_mismatched_closing_tag(self):
-        # Complete block but tags don't match: parser raises, caught, raw returned.
         text = _wire(
             "<tool_call>",
             '<invoke name="get_weather">',
@@ -542,7 +528,6 @@ class TestMinimaxM3Malformed(CustomTestCase):
 
 
 def _parse_segments_text(text, tools):
-    """detect_and_parse on raw text (no namespace wrapping)."""
     detector = MinimaxM3Detector()
     result = detector.detect_and_parse(text, tools)
     return [

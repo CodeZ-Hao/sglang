@@ -11,13 +11,17 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_error_empty_messages
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_non_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_streaming
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
 """
 
 import json
 import unittest
 
+import anthropic
 import requests
 
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -28,8 +32,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=140, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestAnthropicServer(CustomTestCase):
@@ -79,6 +83,70 @@ class TestAnthropicServer(CustomTestCase):
         return payload
 
     # ---- Non-streaming tests ----
+
+    def test_tool_result_image_content_conversion(self):
+        """Tool-result image blocks should be preserved as OpenAI image_url content."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "I have called read_file to get an image. What color is it?",
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_123",
+                            "name": "read_file",
+                            "input": {"file_path": "/test.png"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_123",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "abcd",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        tool_messages = [m for m in converted["messages"] if m.get("role") == "tool"]
+        self.assertEqual(
+            len(tool_messages),
+            1,
+            f"Expected one tool message, got: {converted['messages']}",
+        )
+
+        tool_message = tool_messages[0]
+        self.assertEqual(tool_message["tool_call_id"], "call_123")
+        self.assertIsInstance(tool_message["content"], list)
+        self.assertEqual(len(tool_message["content"]), 1)
+        self.assertEqual(tool_message["content"][0]["type"], "image_url")
+        self.assertEqual(
+            tool_message["content"][0]["image_url"]["url"],
+            "data:image/png;base64,abcd",
+        )
 
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
@@ -159,6 +227,27 @@ class TestAnthropicServer(CustomTestCase):
         body = resp.json()
         self.assertEqual(body["type"], "message")
         self.assertTrue(len(body["content"]) > 0)
+
+    def test_in_messages_system_role(self):
+        """A ``role: "system"`` turn inside ``messages`` (emitted by some
+        clients, e.g. Claude Code) must be accepted — not rejected with 400.
+        Uses the Anthropic SDK the way a real client would."""
+        client = anthropic.Anthropic(
+            base_url=self.base_url,
+            auth_token=self.api_key,  # Bearer header — SGLang's --api-key checks Authorization
+        )
+        message = client.messages.create(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "system", "content": "Always respond in French."},
+                {"role": "user", "content": "Answer in a few words."},
+            ],
+        )
+        self.assertEqual(message.role, "assistant")
+        self.assertTrue(len(message.content) > 0)
+        self.assertEqual(message.content[0].type, "text")
 
     def test_max_tokens(self):
         """Test max_tokens limits output length."""

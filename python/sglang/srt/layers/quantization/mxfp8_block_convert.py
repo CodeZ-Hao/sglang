@@ -1,9 +1,10 @@
-"""Convert MXFP8 weights to block-fp8 [128,128] for SM90/gfx942.
+"""Convert MXFP8 weights to block-fp8 [128,128] for AMD gfx942 (CDNA3 / MI300).
 
-SM90 (Hopper H20/H100) and gfx942 (CDNA3 / MI300) lack hardware MX-scaled
-matmul. MXFP8 checkpoints (e4m3fn weights + 1x32 UE8M0 scales) are converted
-at load time to block-wise FP8 [128,128] (e4m3fn + fp32 scales), which runs
-through SGLang's native block-fp8 kernels (triton / cutlass / deep_gemm).
+gfx942 has no hardware MX-scaled matmul: Triton's ``tl.dot_scaled`` fails to
+lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+checkpoints (e4m3fn weights + 1x32 UE8M0 scales) are converted at load time to
+block-wise FP8 [128,128] (e4m3fn + fp32 scales), which runs through SGLang's
+native DeepSeek-V3 block-fp8 kernels (aiter / triton). The conversion is:
 
     bf16 = e4m3.to(f32) * exp2(ue8m0_scale.to(f32) - 127.0)   # dequant 1x32
     block-fp8 = per-128x128-block quantize(bf16)              # requant 128x128
@@ -42,6 +43,8 @@ def bf16_to_block_fp8_128(
     """Quantize a 2D bf16/fp32 weight to block-wise FP8 (e4m3fn) + fp32 scales.
 
     Returns (qweight [N,K] e4m3fn, scale [ceil(N/block), ceil(K/block)] fp32).
+    Mirrors the DeepSeek-V3 block-fp8 contract (divide by e4m3fn max 448).
+    The downstream gfx942 path normalizes e4m3fn -> e4m3fnuz separately.
     """
     n, k = weight.shape
     pn = ((n + block - 1) // block) * block
@@ -60,6 +63,10 @@ def bf16_to_block_fp8_128(
 def convert_mxfp8_weight_to_block_fp8(
     weight: torch.Tensor, scale_u8: torch.Tensor, block: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [block,block] (e4m3fn + fp32)."""
+    """MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [block,block] (e4m3fn + fp32).
+
+    Used on gfx942 to run MXFP8 checkpoints through the fast native block-fp8
+    kernels.
+    """
     bf16 = dequant_mxfp8_2d_to_bf16(weight, scale_u8)
     return bf16_to_block_fp8_128(bf16, block=block)

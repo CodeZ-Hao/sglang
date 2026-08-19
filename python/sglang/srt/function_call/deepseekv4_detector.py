@@ -1,23 +1,60 @@
+import logging
+
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+
+logger = logging.getLogger(__name__)
 
 
 class DeepSeekV4Detector(DeepSeekV32Detector):
     """
-    Detector for DeepSeek V4 DSML tool-call format.
+    Detector for DeepSeek V4 model function call format.
 
-    Identical to V3.2 except the outer block wrapper is
-    ``<｜DSML｜tool_calls>...</｜DSML｜tool_calls>`` instead of
-    ``<｜DSML｜function_calls>...</｜DSML｜function_calls>``. The inner
-    ``<｜DSML｜invoke>`` / ``<｜DSML｜parameter>`` shape is unchanged.
+    The DeepSeek V4 format uses XML-like DSML tags to delimit function calls.
+    Supports two parameter formats:
 
-    Example (XML parameters):
+    Format 1 - XML Parameter Tags:
     ```
     <｜DSML｜tool_calls>
-        <｜DSML｜invoke name="get_weather">
-        <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
-        </｜DSML｜invoke>
+        <｜DSML｜invoke name="function_name">
+        <｜DSML｜parameter name="param_name" string="true">value</｜DSML｜parameter>
+        ...
+    </｜DSML｜invoke>
     </｜DSML｜tool_calls>
     ```
+
+    Format 2 - Direct JSON:
+    ```
+    <｜DSML｜tool_calls>
+        <｜DSML｜invoke name="function_name">
+        {
+            "param_name": "value"
+        }
+    </｜DSML｜invoke>
+    </｜DSML｜tool_calls>
+    ```
+
+    Examples:
+    ```
+    <｜DSML｜tool_calls>
+        <｜DSML｜invoke name="get_favorite_tourist_spot">
+        <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜tool_calls>
+
+    <｜DSML｜tool_calls>
+        <｜DSML｜invoke name="get_favorite_tourist_spot">
+        { "city": "San Francisco" }
+    </｜DSML｜invoke>
+    </｜DSML｜tool_calls>
+    ```
+
+    Key Components:
+    - Tool Calls Section: Wrapped between `<｜DSML｜tool_calls>` and `</｜DSML｜tool_calls>`
+    - Individual Tool Call: Wrapped between `<｜DSML｜invoke name="...">` and `</｜DSML｜invoke>`
+    - Parameters: Either XML tags or direct JSON format
+    - Supports multiple tool calls
+
+    Reference: DeepSeek V4 format specification
     """
 
     def __init__(self):

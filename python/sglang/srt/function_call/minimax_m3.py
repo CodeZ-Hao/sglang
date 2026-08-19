@@ -21,31 +21,11 @@ NUMBER_TYPES = {"number", "float"}
 BOOLEAN_TYPES = {"boolean", "bool"}
 SCALAR_TYPES = STRING_TYPES | INTEGER_TYPES | NUMBER_TYPES | BOOLEAN_TYPES | {"null"}
 CONTAINER_TYPES = {"object", "array"}
-# Only these exact-case literals are treated as JSON null, and only when the
-# schema permits null. "none"/"nil" are never coerced — they are legitimate
-# string values (e.g. enums like ["none", "low", "high"]).
+# Exact-case only; "none"/"nil" are valid string enum values, never null-coerced.
 NULL_STRINGS = {"null", "Null", "NULL"}
 
 
 class MinimaxM3Detector(BaseFormatDetector):
-    """
-    Detector for MiniMax M3 models.
-
-    Example raw output:
-        ]<]minimax[>[<tool_call>
-        ]<]minimax[>[<invoke name="func1">
-        ]<]minimax[>[<p1>value1
-        ]<]minimax[>[</p1>
-        ]<]minimax[>[<p2>
-        ]<]minimax[>[<item>
-        ]<]minimax[>[<k>val
-        ]<]minimax[>[</k>
-        ]<]minimax[>[</item>
-        ]<]minimax[>[</p2>
-        ]<]minimax[>[</invoke>
-        ]<]minimax[>[</tool_call>
-    """
-
     TOOL_CALL_START = MINIMAX_NS_TOKEN + "<tool_call>"
     TOOL_CALL_END = MINIMAX_NS_TOKEN + "</tool_call>"
 
@@ -54,9 +34,6 @@ class MinimaxM3Detector(BaseFormatDetector):
     PARAM_START_PREFIX = MINIMAX_NS_TOKEN + "<"
     TAG_SPACING_CHARS = " \t\r\n"
     TAG_SPACING_RE = re.compile(re.escape(MINIMAX_NS_TOKEN) + r"[ \t\r\n]+(?=<)")
-
-    # Matches <invoke name="...">
-    INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)">')
 
     def __init__(self):
         super().__init__()
@@ -459,14 +436,11 @@ class MinimaxM3Detector(BaseFormatDetector):
         schema_types = set(self._schema_types(schema))
         null_permitted = "null" in schema_types
 
-        # Plain string-typed leaf: return verbatim, never null-coerce. This keeps
-        # the non-streaming path in agreement with the streaming path, which emits
-        # string values literally (e.g. "null"/"none"/"nil" stay strings).
+        # Return verbatim; streaming emits strings literally, so null-coercing
+        # here would diverge the non-streaming path from streaming.
         if schema_types & STRING_TYPES and not null_permitted:
             return value
 
-        # Only exact-case null literals become JSON null, and only when the schema
-        # is nullable. "none"/"nil" are valid strings and must never be coerced.
         if null_permitted:
             if value in NULL_STRINGS:
                 return None

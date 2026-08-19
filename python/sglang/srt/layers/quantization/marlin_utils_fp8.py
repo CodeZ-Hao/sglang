@@ -14,11 +14,12 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -39,6 +40,22 @@ def fp8_fused_exponent_bias_into_scales(scales):
     return scales * s
 
 
+def fake_apply_fp8_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    out_shape = input.shape[:-1] + (size_n,)
+    fake_output = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    return fake_output
+
+
+@register_custom_op(fake_impl=fake_apply_fp8_marlin_linear)
 def apply_fp8_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -189,18 +206,6 @@ def prepare_moe_fp8_layer_for_marlin(
     k = layer.hidden_size
     n = layer.intermediate_size_per_partition
     weight_block_size = getattr(layer, "weight_block_size", None)
-
-    # When wrapped by kt_ep_wrapper, the layer only holds num_gpu_experts
-    # weights while layer.num_experts still reports the global total.
-    # Derive the actual expert count from the weight tensor itself.
-    actual_e = layer.w13_weight.shape[0]
-    if actual_e != e:
-        logger.debug(
-            "layer.num_experts=%d but w13_weight.shape[0]=%d — using the "
-            "latter (kt_ep_wrapper GPU-expert subset).",
-            e, actual_e,
-        )
-        e = actual_e
 
     # WORKSPACE
     device = layer.w13_weight.device

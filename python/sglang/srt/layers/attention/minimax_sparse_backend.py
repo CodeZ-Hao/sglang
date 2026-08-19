@@ -18,11 +18,20 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
+    # Same convention as the KV pools: the fp8 tensor stores value/scale and
+    # the attention kernels multiply the logits back by the scale (None = unit).
+    if q_scale is not None:
+        q = q / q_scale
+    return q.to(torch.float8_e4m3fn)
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -31,6 +40,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
         self.max_context_len = int(runner.model_config.context_len)
+        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
+        if self.fp8_attn_gemm:
+            assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
+                "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
+                f"{self.kv_pool.main_pool.dtype}"
+            )
 
         hf_config = runner.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(hf_config)
@@ -42,11 +57,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
-        # assert self.idx_head_dim == head_dim
 
-        # max_seqlen for the current forward pass, stored as a plain Python int
-        # so that it is safe to use inside CUDA graphs (no .item() at graph time).
-        # Populated by init_forward_metadata* before each forward.
+        # Plain Python int so it is safe inside CUDA graphs (no .item() at graph time).
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
 
@@ -68,22 +80,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
-        # NVIDIA Blackwell (SM100): use MiniMax's MSA kernel (fmha_sm100) only
-        # for the main sparse-attention step when the kernel constraints hold.
-        # The lightning indexer remains unchanged; missing fmha_sm100 keeps the
-        # existing Triton path.
+        # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
+        # the kernel is unavailable or its constraints don't hold.
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             msa_available,
         )
 
-        # MSA (fmha_sm100) is bf16/fp16-only. With an fp8 main KV cache
-        # (--kv-cache-dtype fp8_*) keep the sparse path on Triton (it dequants fp8 on
-        # load) rather than feeding fp8 bytes to the bf16 kernel; mirrors vLLM's
-        # select_main_impl_cls (fp8 KV -> Triton, never MSA).
+        # MSA (fmha_sm100) runs bf16, or uniform fp8_e4m3 under fp8 attn-GEMM mode
+        # (which also casts q to fp8). An fp8 main KV cache WITHOUT the flag
+        # would pair a bf16 q with fp8 K/V — unsupported by fmha_sm100's
+        # uniform-dtype kernels — so it stays on the Triton sparse path (which
+        # dequants fp8 on load). e5m2 is never allowed into MSA (fmha_sm100's
+        # variant lookup would silently dispatch the e4m3 kernel).
         _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
+        )
+        _msa_fp8_ok = (
+            self.fp8_attn_gemm and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
         )
         self.use_msa = (
             not envs.SGLANG_DISABLE_MSA.get()
@@ -91,23 +106,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and self.block_size_k == 128
             and self.kv_pool.page_size == self.block_size_k
             and self.topk_blocks in (4, 8, 16, 32)
-            and not _main_kv_is_fp8
+            and (not _main_kv_is_fp8 or _msa_fp8_ok)
         )
-        # Per-forward MSA decode metadata (page table + fmha plan), shared by every
-        # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
+        if (
+            not self.use_msa
+            and not envs.SGLANG_DISABLE_MSA.get()
+            and msa_available()
+            and self.block_size_k == 128
+            and self.kv_pool.page_size != self.block_size_k
+        ):
+            logger.warning(
+                "MiniMax-M3 MSA decode disabled: page_size=%d != sparse block size "
+                "%d. Pass --page-size 128 (with an attention backend that allows it, "
+                "e.g. fa4 or trtllm_mha) to enable the faster MSA kernel; falling "
+                "back to the Triton sparse path.",
+                self.kv_pool.page_size,
+                self.block_size_k,
+            )
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
+            from sglang.srt.runtime_context import get_parallel
 
-            # Per-rank head counts for the decode plan (== runtime q.shape[1] /
-            # k_cache.shape[1]); needed in out_graph where q/k_cache aren't available.
             self.num_q_heads = (
-                runner.model_config.num_attention_heads // get_attention_tp_size()
+                runner.model_config.num_attention_heads // get_parallel().attn_tp_size
             )
-            # KV head count lives on the main sub-pool (== runtime k_cache.shape[1]).
             self.num_kv_heads = self.kv_pool.main_pool.head_num
-            # CUDA-graph decode: one persistent plan + page-table buffer per batch
-            # size, refreshed in place each step (worklist is length-independent).
             self._msa_nb_max = (
                 self.max_context_len + self.block_size_k - 1
             ) // self.block_size_k
@@ -117,19 +140,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.use_dense_sparse_decode = (
             envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
+            # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
+            # unit bmm scales — no fp8 handling yet (follow-up).
+            and not self.fp8_attn_gemm
         )
-        # MSA fmha_sm100 decode is NOT cuda-graph-safe: captured & replayed it returns
-        # wrong results that compound across replays (silent ~14% GSM8K loss on B200;
-        # masked early by radix-cache prefix reuse, then cliffs under sustained load).
-        # Use the MSA decode kernel only when decode does NOT run under cuda graph;
-        # otherwise route the decode step through the cuda-graph-safe Triton sparse path.
-        # MSA still serves prefill (run eager — prefill cuda graph is disabled), where
-        # its long-context speedup matters.
-        #
-        # Decide from the resolved cuda_graph_config — the same source
-        # init_decode_cuda_graph uses to decide capture — not the legacy disable_*
-        # server_args flags: the two can disagree under config-native flags, and a
-        # mismatch could capture the unsafe MSA decode kernel into a graph.
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
@@ -140,13 +154,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
-        self._use_msa_decode = self.use_msa and not _decode_cuda_graph
+        self._use_msa_decode = self.use_msa and (
+            not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
+        )
 
-        # MSA + speculative decode + cuda graph is unsupported: spec verify
-        # (TARGET_VERIFY) batches route to forward_extend and are captured into the
-        # decode graph, which both dereferences extend metadata absent in the capture
-        # batch and would record the MSA prefill kernel into a graph. Fail loudly at
-        # startup instead of crashing mid-capture.
+        # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
+        # route to forward_extend, dereferencing absent extend metadata. Fail at startup.
         if (
             self.use_msa
             and _decode_cuda_graph
@@ -157,90 +170,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "CUDA graph. Use --disable-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
                 "disable speculative decoding."
             )
-        # MSA owns the main decode step unless dense-sparse-decode does; the dense
-        # path only engages when k_cache.shape[1] == 1 (see forward_decode).
         self._msa_owns_decode = self._use_msa_decode and not (
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
-        # The page table + effective KV length are allocated and returned by the
-        # fused decode top-k kernel each layer, so the backend keeps no metadata.
         self.dense_backend: Optional[AttentionBackend] = None
 
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"msa_decode={self._use_msa_decode}, "
+            f"msa_owns_decode={self._msa_owns_decode}, "
+            f"decode_cuda_graph={_decode_cuda_graph}, "
+            f"fp8_attn_gemm={self.fp8_attn_gemm}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
-
-    # ------------------------------------------------------------------
-    # Delegation helpers
-    # ------------------------------------------------------------------
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # kvcache's base AttentionBackend still marks init_forward_metadata as
-        # abstract; upstream made it a default wrapper. Provide that wrapper
-        # here so the abstract gate passes.
-        self.init_forward_metadata_out_graph(forward_batch)
-        self.init_forward_metadata_in_graph(forward_batch)
-
-    # --- adapters: kvcache cuda_graph_runner still calls the legacy split-API.
-    # Upstream M3 only implements *_out_graph / *_in_graph. Bridge them.
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs,
-        num_tokens,
-        req_pool_indices,
-        seq_lens,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-    ):
-        from types import SimpleNamespace
-        fb = SimpleNamespace(
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens.cpu() if torch.is_tensor(seq_lens) else seq_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-        )
-        self.init_forward_metadata_out_graph(fb, in_capture=True)
-        self.init_forward_metadata_in_graph(fb)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs,
-        req_pool_indices,
-        seq_lens,
-        seq_lens_sum,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-        seq_lens_cpu=None,
-    ):
-        # Prefer the explicit forward_batch the runner stashes via
-        # `attn_backend._replay_forward_batch = forward_batch` immediately
-        # before calling this method (cuda_graph_runner.py ~line 1040).
-        fb = getattr(self, "_replay_forward_batch", None)
-        if fb is None:
-            from types import SimpleNamespace
-            fb = SimpleNamespace(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu if seq_lens_cpu is not None
-                else (seq_lens.cpu() if torch.is_tensor(seq_lens) else seq_lens),
-                forward_mode=forward_mode,
-                spec_info=spec_info,
+        if self.fp8_attn_gemm and self.use_msa:
+            logger.info(
+                "[MiniMaxSparse] fp8 MSA active: the first forward may "
+                "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
+                "take minutes; compiles serialize across TP ranks)."
             )
-        self.init_forward_metadata_out_graph(fb, in_capture=False)
-        self.init_forward_metadata_in_graph(fb)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
-        # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
@@ -252,15 +208,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
-        # Build the MSA decode plan + page table here (eager, outside graph capture)
-        # so forward_decode — captured into the graph — only runs device-side ops.
-        # Runs at capture, replay, and eager, refreshing the persistent buffers the
-        # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
+        # Build plan + page table eager (outside capture) so captured forward_decode
+        # runs only device-side ops; host-side code can't be captured.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
-        """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             build_msa_decode_cg_plan,
             update_msa_decode_cg_meta,
@@ -279,6 +232,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.topk_blocks,
                 bs,
                 device=device,
+                is_fp8=self.fp8_attn_gemm,
             )
             kv_indices_buf = torch.zeros(
                 bs * self._msa_nb_max, dtype=torch.int32, device=device
@@ -366,6 +320,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 v,
                 idx_k,
                 None if disable_value else idx_v,
+                layer.k_scale_float,
+                layer.v_scale_float,
+                layer.idx_k_scale_float,
+                layer.idx_v_scale_float,
             )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -382,22 +340,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
         if forward_batch.extend_prefix_lens is not None:
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
             prefix_lens = torch.zeros_like(seq_lens)
 
-        # In DP attention mode, q may be padded beyond the actual token count
-        # for collective communication alignment. Trim to actual tokens so
-        # the sparse attention kernel sees consistent shapes.
-        #
-        # Source the token count from CPU-side metadata when available so we do
-        # not force a GPU->CPU sync (cu_seqlens[-1].item()) on every sparse
-        # layer of every prefill. extend_seq_lens_cpu is a plain list of ints
-        # (ForwardBatch sets it from extend_seq_lens.cpu()), so sum() is a host
-        # op and the result is identical to cu_seqlens[-1]. Fall back to the
-        # device tensor only when CPU metadata is absent.
+        # DP attention pads q beyond the real token count for collective alignment;
+        # trim to actual tokens so the sparse kernel sees consistent shapes.
         if forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
         else:
@@ -406,6 +356,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
+
+        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+        # the bf16 k/v) and the DP trim.
+        if self.fp8_attn_gemm:
+            q = _quant_q_fp8(q, layer.q_scale_float)
+            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
         idx_o, o = minimax_sparse_prefill(
             q,
@@ -431,11 +387,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_value,
             use_msa=self.use_msa,
-            # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
         )
 
-        # Pad output back to original size for DP communication
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
@@ -455,11 +415,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _dense_sparse_main_decode(
         self,
-        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
-        page_table: torch.Tensor,  # [bs, max_sparse_pages] int32 (from the indexer)
-        real_seq_lens: torch.Tensor,  # [bs] int32, effective KV length per query
-        k_cache: torch.Tensor,  # [max_slots, 1, head_dim]
-        v_cache: torch.Tensor,  # [max_slots, 1, head_dim]
+        q: torch.Tensor,
+        page_table: torch.Tensor,
+        real_seq_lens: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
         layer,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
@@ -512,6 +472,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             v,
             idx_k,
             None if disable_value else idx_v,
+            layer.k_scale_float,
+            layer.v_scale_float,
+            layer.idx_k_scale_float,
+            layer.idx_v_scale_float,
         )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -521,12 +485,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         attn_fn = None
-        if (
-            self.use_dense_sparse_decode
-            and k_cache.shape[1] == 1
-            and self.dense_backend is not None
-            and hasattr(self.dense_backend, "workspace_buffer")
-        ):
+        if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
 
             def attn_fn(main_q, page_table, real_seq_lens):
                 return self._dense_sparse_main_decode(
@@ -539,9 +498,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch,
                 )
 
-        # The MSA decode page table + plan are built once per forward in
-        # init_forward_metadata_out_graph (eager, outside graph capture) and shared
-        # across all sparse layers; here we just consume the cached metadata.
         msa_kv_indices = msa_plan = None
         if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:
@@ -553,6 +509,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "MSA decode metadata missing: init_forward_metadata_out_graph "
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
+
+        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+        # the bf16 k/v).
+        if self.fp8_attn_gemm:
+            q = _quant_q_fp8(q, layer.q_scale_float)
+            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
         idx_o, o = minimax_sparse_decode(
             q,
@@ -579,6 +541,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
         )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -587,8 +555,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
 
 class MiniMaxHybridAttnBackend(AttentionBackend):
-    """Combines a dense backend and a sparse backend, routing by call site."""
-
     def __init__(
         self,
         dense_backend: AttentionBackend,
@@ -598,11 +564,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
-        # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # delegate so the dense (FlashInfer) backend keeps its own eager init.
         self.sparse.init_forward_metadata(forward_batch)
         self.dense.init_forward_metadata(forward_batch)
 
@@ -615,22 +579,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
         self.dense.init_forward_metadata_in_graph(forward_batch)
-
-    # --- Legacy split-API adapters: kvcache's cuda_graph_runner still calls
-    # capture/replay via the old API. Delegate to both sub-backends; the sparse
-    # child has its own old->new adapter.
-    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        self.sparse.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
-        self.dense.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
-
-    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-        # Propagate the runner-stashed forward_batch to the sparse child so its
-        # adapter can prefer it over the SimpleNamespace fallback.
-        self.sparse._replay_forward_batch = getattr(
-            self, "_replay_forward_batch", None
-        )
-        self.sparse.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
-        self.dense.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
@@ -654,13 +602,10 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
 
-        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
-        # attention the per-rank token block is padded to an even length
-        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
-        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
-        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
-        # the real token count and re-pad the output; k/v stay untrimmed so the
-        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
+        # DP attention pads q to an even length but flashinfer builds qo_indptr from
+        # extend_seq_lens, so padded q.shape[0] != qo_indptr[-1] and paged-prefill
+        # raises. Trim q and re-pad output; k/v stay untrimmed so KV-cache writes
+        # align with out_cache_loc.
         mode = forward_batch.forward_mode
         if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))

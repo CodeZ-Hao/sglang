@@ -127,8 +127,8 @@ def _make_routing_data_v4(
     convention). Pad cost is ~33% extra slot bookkeeping; gemm work is
     unchanged because invalid slots are not routed.
     """
-    from triton_kernels.routing import routing_from_bitmatrix
     from triton_kernels.tensor import Bitmatrix
+    from triton_kernels.routing import routing_from_bitmatrix
 
     topk_ids_i16 = topk_ids.to(torch.int16).contiguous()
     topk_weights_bf = topk_weights.to(torch.bfloat16).contiguous()
@@ -172,19 +172,19 @@ def _make_routing_data_v4(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 
-    bitmatrix = Bitmatrix(
-        bitmatrix_data,
-        shape=[n_rows, bm_cols * 32],
-        shape_max=[n_rows, None],
-        scratchpad=None,
-    )
-
     # matmul_ogs convention: invalid topk weights are -1.0 (not 0).
     # Use masked_fill (Python-scalar) instead of torch.where(...,
     # torch.tensor(-1.0, ...), ...) so this is CUDA-graph-capture safe
     # (no H2D copy during capture).
     topk_weights_bf = topk_weights_bf.masked_fill(topk_ids_i16 == -1, -1.0)
 
+    # triton_kernels >= 1.0.0: routing_from_bitmatrix consumes a Bitmatrix.
+    bitmatrix = Bitmatrix(
+        bitmatrix_data,
+        shape=[n_rows, bm_cols * 32],
+        shape_max=[n_rows, None],
+        scratchpad=None,
+    )
     return routing_from_bitmatrix(
         bitmatrix, topk_weights_bf, topk_ids_i16, num_local_experts, n_topk
     )

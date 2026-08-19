@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/models/registry.py
 
 import importlib
@@ -104,9 +106,7 @@ def import_model_classes(package_name: str, strict: bool = False):
             except Exception as e:
                 if strict:
                     raise
-                logger.warning(
-                    f"In import_model_classes: Ignore import error when loading {name}: {e}"
-                )
+                logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

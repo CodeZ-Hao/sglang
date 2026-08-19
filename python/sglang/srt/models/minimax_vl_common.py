@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# Shared vision tower and helpers for MiniMax VL models.
-#
-# Both MiniMax M2 VL and M3 VL share the same vision encoder (CLIP-based ViT
-# with 3D RoPE), multimodal projector, patch merger, and vision-side weight
-# loading logic. The text backbone differs (M2 = Mixtral-style MoE, M3 =
-# custom MoE with optional shared experts / sparse attention), so the entry
-# classes themselves stay separate; everything reusable lives here.
 
 import logging
 from dataclasses import dataclass, fields
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,12 +14,10 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_MAX_SEQLEN_BUCKETS,
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -36,7 +27,7 @@ from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
@@ -63,6 +54,10 @@ class CLIPVisionConfig:
     def from_dict(cls, d: dict) -> "CLIPVisionConfig":
         valid_keys = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in d.items() if k in valid_keys}
+        if "rope_theta" not in filtered and isinstance(d.get("rope_parameters"), dict):
+            rope_theta = d["rope_parameters"].get("rope_theta")
+            if rope_theta is not None:
+                filtered["rope_theta"] = rope_theta
         return cls(**filtered)
 
 
@@ -86,10 +81,8 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             else text_hidden_size
         )
 
-        # DP mode: each rank handles different images, so all-reduce is
-        # disallowed and tp_size must be 1.
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -143,8 +136,8 @@ class MiniMaxVLPatchMerger(nn.Module):
             else text_hidden_size
         )
 
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -183,7 +176,6 @@ class MiniMaxVLPatchMerger(nn.Module):
 def _prepare_rotary_cos_sin(
     freqs: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Precompute cos/sin from raw freqs [seq, rope_dim/2] -> (cos, sin) each [seq, 1, rope_dim]."""
     cos = freqs.cos().repeat(1, 2).unsqueeze(-2).float()
     sin = freqs.sin().repeat(1, 2).unsqueeze(-2).float()
     return cos, sin
@@ -196,11 +188,7 @@ def _minimax_rope_applier(
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     x_shape=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embedding to vision Q/K tensors.
-
-    Uses split-apply-concat to handle cases where RoPE dimension differs from
-    head_dim (e.g., 3D RoPE with rope_dim=60 vs head_dim=64).
-    """
+    """3D RoPE uses rope_dim=60 < head_dim=64; trailing dims pass through unrotated."""
     cos, sin = position_embeddings
     rot_dim = cos.shape[-1]
 
@@ -270,8 +258,8 @@ class CLIPEncoderLayer(nn.Module):
 
         self.embed_dim = config.hidden_size
         self.use_data_parallel = use_data_parallel
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
@@ -319,6 +307,7 @@ class CLIPEncoderLayer(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -328,6 +317,7 @@ class CLIPEncoderLayer(nn.Module):
             position_embeddings=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            forward_metadata=forward_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -346,7 +336,6 @@ class CLIPEncoder(nn.Module):
         self,
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
@@ -356,11 +345,6 @@ class CLIPEncoder(nn.Module):
         self.config = config
         self.use_data_parallel = use_data_parallel
 
-        num_hidden_layers = (
-            config.num_hidden_layers
-            if num_hidden_layers_override is None
-            else num_hidden_layers_override
-        )
         self.layers = nn.ModuleList(
             [
                 CLIPEncoderLayer(
@@ -370,7 +354,7 @@ class CLIPEncoder(nn.Module):
                     use_data_parallel=use_data_parallel,
                     workspace_buffer=workspace_buffer,
                 )
-                for layer_idx in range(num_hidden_layers)
+                for layer_idx in range(config.num_hidden_layers)
             ]
         )
 
@@ -381,9 +365,8 @@ class CLIPEncoder(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
-        return_all_hidden_states: bool = False,
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        hidden_states_pool = [inputs_embeds]
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
+    ) -> torch.Tensor:
         hidden_states = inputs_embeds
         cos_sin = _prepare_rotary_cos_sin(rotary_pos_emb)
 
@@ -394,12 +377,9 @@ class CLIPEncoder(nn.Module):
                 cos_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                forward_metadata=forward_metadata,
             )
-            if return_all_hidden_states:
-                hidden_states_pool.append(hidden_states)
 
-        if return_all_hidden_states:
-            return hidden_states_pool
         return hidden_states
 
 
@@ -409,7 +389,6 @@ class MiniMaxVLVisionTransformer(nn.Module):
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         *,
-        num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -434,7 +413,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         workspace_buffer: Optional[torch.Tensor] = None
         if (
-            get_global_server_args().mm_attention_backend == "flashinfer_cudnn"
+            get_mm().mm_attention_backend == "flashinfer_cudnn"
             and torch.cuda.is_available()
         ):
             workspace_buffer = torch.empty(
@@ -446,7 +425,6 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self.encoder = CLIPEncoder(
             config=config,
             quant_config=quant_config,
-            num_hidden_layers_override=num_hidden_layers_override,
             prefix=f"{prefix}.encoder",
             use_data_parallel=use_data_parallel,
             workspace_buffer=workspace_buffer,
@@ -463,7 +441,6 @@ class MiniMaxVLVisionTransformer(nn.Module):
         head_dim = embed_dim // config.num_attention_heads
         rope_dims = 2 * (head_dim // 2)
 
-        # 3D RoPE: split rope dims evenly across t/h/w
         self.t_dim = int(2 * ((rope_dims // 3) // 2))
         self.h_dim = int(2 * ((rope_dims // 3) // 2))
         self.w_dim = int(2 * ((rope_dims // 3) // 2))
@@ -633,9 +610,6 @@ class MiniMaxVLVisionTransformer(nn.Module):
         *,
         elem_per_token: int,
     ) -> np.ndarray:
-        """Build packed [qk_indptr, v_indptr, o_indptr] element indptrs for the
-        flashinfer_cudnn vision backend; q/k/v/o all share the same indptr in this
-        ViT path."""
         assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
         B = int(token_cu_seqlens.size - 1)
         B_padded = cls._bucket_flashinfer_batch_size(B)
@@ -650,9 +624,6 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self,
         cu_seq_len: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Convert the standard token cu_seqlens into the packed indptrs +
-        padded sequence_lengths + bucketed max_seqlen that the flashinfer_cudnn
-        vision backend expects."""
         device = cu_seq_len.device
         token_cu_seqlens_np = cu_seq_len.detach().cpu().numpy().astype(np.int32)
 
@@ -665,7 +636,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
             token_cu_seqlens_np
         )
 
-        attn_tp_size = 1 if self.use_data_parallel else get_attention_tp_size()
+        attn_tp_size = 1 if self.use_data_parallel else get_parallel().attn_tp_size
         elem_per_token = self.config.hidden_size // attn_tp_size
 
         offsets_packed = self._compute_flashinfer_batch_offsets_packed(
@@ -708,12 +679,24 @@ class MiniMaxVLVisionTransformer(nn.Module):
         max_seqlen: Optional[int] = None
         sequence_lengths: Optional[torch.Tensor] = None
         encoder_cu_seq_len = cu_seq_len
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+        if get_mm().mm_attention_backend == "flashinfer_cudnn":
             (
                 encoder_cu_seq_len,
                 sequence_lengths,
                 max_seqlen,
             ) = self._build_flashinfer_cudnn_inputs(cu_seq_len)
+
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seq_len,
+            device=hidden_states.device,
+            packed_indptrs=(
+                encoder_cu_seq_len
+                if get_mm().mm_attention_backend == "flashinfer_cudnn"
+                else None
+            ),
+            sequence_lengths=sequence_lengths,
+            flashinfer_max_seqlen=max_seqlen,
+        )
 
         return self.encoder(
             inputs_embeds=hidden_states,
@@ -721,17 +704,11 @@ class MiniMaxVLVisionTransformer(nn.Module):
             rotary_pos_emb=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
-            return_all_hidden_states=False,
+            forward_metadata=forward_metadata,
         )
 
 
 class MiniMaxVLVisionModel(nn.Module):
-    """ViT + multimodal projector + patch merger.
-
-    The same module is used by every MiniMax VL variant; only the text
-    backbone differs across the entry classes.
-    """
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -739,12 +716,14 @@ class MiniMaxVLVisionModel(nn.Module):
         projector_hidden_size: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        multimodal_projector_bias: bool = True,
+        patch_merge_bias: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
 
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.vision_config = config
 
         self.vision_model = MiniMaxVLVisionTransformer(
@@ -758,9 +737,7 @@ class MiniMaxVLVisionModel(nn.Module):
             vision_hidden_size=config.hidden_size,
             text_hidden_size=text_hidden_size,
             projector_hidden_act=getattr(config, "projector_hidden_act", "gelu"),
-            multimodal_projector_bias=getattr(
-                config, "multimodal_projector_bias", True
-            ),
+            multimodal_projector_bias=multimodal_projector_bias,
             projector_hidden_size=projector_hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("multi_modal_projector", prefix),
@@ -775,7 +752,7 @@ class MiniMaxVLVisionModel(nn.Module):
             spatial_merge_size=spatial_merge_size,
             text_hidden_size=text_hidden_size,
             projector_hidden_act=getattr(config, "projector_hidden_act", "gelu"),
-            patch_merge_bias=getattr(config, "patch_merge_bias", True),
+            patch_merge_bias=patch_merge_bias,
             projector_hidden_size=projector_hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("patch_merge_mlp", prefix),
@@ -791,18 +768,11 @@ class MiniMaxVLVisionModel(nn.Module):
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
         hidden_states = self.vision_model(pixel_values=pixel_values, grid_thw=grid_thw)
-        # VisionAttention returns [1, seq, dim]; flatten back to [seq, dim]
-        # for projector / patch_merge_mlp which operate per-token.
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.squeeze(0)
         hidden_states = self.multi_modal_projector(hidden_states)
         hidden_states = self.patch_merge_mlp(hidden_states)
         return hidden_states
-
-
-# ---------------------------------------------------------------------------
-# Shared multimodal feature extraction
-# ---------------------------------------------------------------------------
 
 
 def _run_vision_tower(
@@ -854,11 +824,6 @@ def get_video_feature(
     )
 
 
-# ---------------------------------------------------------------------------
-# Shared vision-side weight loading
-# ---------------------------------------------------------------------------
-
-
 def _parse_vit_layer_idx(name: str) -> Optional[int]:
     parts = name.split(".")
     for i, p in enumerate(parts):
@@ -874,13 +839,6 @@ def load_vision_weight(
     vit_qkv_weights: dict,
     vit_qkv_biases: dict,
 ) -> None:
-    """Load a single non-LLM (vision tower / projector / patch merger) weight.
-
-    For ``self_attn.{q,k,v}_proj`` the weights are buffered in
-    ``vit_qkv_weights`` / ``vit_qkv_biases`` for later merging via
-    :func:`merge_vit_qkv_weights`. All other vision weights are loaded
-    directly into ``params_dict``.
-    """
     if (
         "self_attn.q_proj" in name
         or "self_attn.k_proj" in name
@@ -918,7 +876,6 @@ def merge_vit_qkv_weights(
     vit_qkv_biases: dict,
     params_dict: dict,
 ) -> None:
-    """Concat the buffered q/k/v tensors and load them into ``qkv_proj``."""
     for layer_idx, qkv_dict in vit_qkv_weights.items():
         if {"q", "k", "v"} <= qkv_dict.keys():
             merged = torch.cat([qkv_dict["q"], qkv_dict["k"], qkv_dict["v"]], dim=0)

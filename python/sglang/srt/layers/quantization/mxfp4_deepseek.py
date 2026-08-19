@@ -403,6 +403,19 @@ class DeepSeekMxfp4MoEMethod:
             return
 
         _ensure_trtllm_mxfp4_ops()
+        import os as _os
+
+        if _os.environ.get("SGLANG_DSV4_MXFP4_DBG"):
+            import traceback as _tb
+            _w13 = getattr(layer, "w13_weight", None)
+            print(
+                f"[MXFP4-DBG] trtllm path layer={self.prefix} "
+                f"w13={None if _w13 is None else tuple(_w13.shape)} "
+                f"method={type(self).__name__} layer_cls={type(layer).__name__}",
+                flush=True,
+            )
+            for _line in _tb.format_stack()[-4:]:
+                print("  " + _line.strip().splitlines()[0], flush=True)
         w13_w, w13_s = reorder_w1w3_to_w3w1(
             layer.w13_weight.data, layer.w13_weight_scale_inv.data
         )
@@ -545,10 +558,10 @@ class DeepSeekMxfp4MoEMethod:
 
             routed_scale = 1.0
             if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-                configured_scale = layer.moe_runner_config.routed_scaling_factor
+                configured_scale = self.moe_runner_config.routed_scaling_factor
                 if configured_scale is not None:
                     routed_scale = configured_scale
-            swiglu_limit = layer.moe_runner_config.swiglu_limit
+            swiglu_limit = self.moe_runner_config.swiglu_limit
             output = apply_v4_marlin_moe(
                 hidden_states=hidden_states,
                 prepared=layer._v4_marlin_weights,
@@ -591,7 +604,7 @@ class DeepSeekMxfp4MoEMethod:
                     topk_ids + local_expert_offset,
                     topk_ids,
                 )
-            rsf = layer.moe_runner_config.routed_scaling_factor
+            rsf = self.moe_runner_config.routed_scaling_factor
             # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
             # kernels GPU MoE path applies the same gate/up clamp as
             # trtllm's gemm1_clamp_limit and deep_gemm's _apply_swiglu_limit.
@@ -747,7 +760,7 @@ class DeepSeekMxfp4MoEMethod:
         )[0]
 
         if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-            rsf = layer.moe_runner_config.routed_scaling_factor
+            rsf = self.moe_runner_config.routed_scaling_factor
             if rsf is not None and rsf != 1.0:
                 output.mul_(rsf)
 

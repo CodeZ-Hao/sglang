@@ -10,16 +10,21 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
-    MHATokenToKOnlyPoolHost,
-    MHATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=9, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 def _cuda_major() -> int:
@@ -30,10 +35,8 @@ def _cuda_major() -> int:
         return 0
 
 
-# direct+page_first_direct host transfer routes to the AOT
-# transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which returns
-# cudaErrorInvalidValue on CUDA 13 and throws instead of falling back. M3 sparse
-# production uses io_backend="kernel" + layer_first, not this combo.
+# direct+page_first_direct routes to transfer_kv_all_layer_direct_lf_pf, which on
+# CUDA 13 throws (cudaErrorInvalidValue) instead of falling back. M3 uses kernel+layer_first.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 
@@ -316,9 +319,16 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             page_size,
             device="cuda" if io_backend == "kernel" else "cpu",
         )
+        # page_first main-KV backup (staged_write_back.cuh) needs CPU dst_indices,
+        # index-k backup (hicache.cuh) needs CUDA indices — feed a CPU copy to main only.
+        kv_host_indices = (
+            host_indices.cpu()
+            if (io_backend, layout) == ("kernel", "page_first")
+            else host_indices
+        )
 
         kv_host.backup_from_device_all_layer(
-            device_pool.main_pool, host_indices, device_indices, io_backend
+            device_pool.main_pool, kv_host_indices, device_indices, io_backend
         )
         index_host.backup_from_device_all_layer(
             device_pool.index_k_pool, host_indices, device_indices, io_backend
@@ -382,6 +392,13 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
     def test_device_to_host_kernel_layer_first(self):
         self._run_device_to_host_copy(io_backend="kernel", layout="layer_first")
 
+    @unittest.skipIf(
+        is_hip(),
+        "ROCm sgl-kernel transfer_kv_all_layer_lf_pf requires a CUDA dst-indices "
+        "tensor for the kernel+page_first combo, while CUDA accepts the CPU "
+        "dst-indices this combo feeds. The production io_backend=kernel + "
+        "layer_first path is covered by test_device_to_host_kernel_layer_first.",
+    )
     def test_device_to_host_kernel_page_first(self):
         self._run_device_to_host_copy(io_backend="kernel", layout="page_first")
 

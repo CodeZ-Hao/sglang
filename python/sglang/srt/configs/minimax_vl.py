@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HuggingFace config for the MiniMax M3 VL family."""
 
 from typing import Optional
 
@@ -10,13 +9,11 @@ from transformers.models.auto import CONFIG_MAPPING
 def _coerce_sub_config(
     sub_config: Optional[dict], default_model_type: str
 ) -> Optional[PretrainedConfig]:
-    """Convert a config dict to a ``PretrainedConfig`` instance.
+    """Convert a config dict to a ``PretrainedConfig``.
 
-    If ``model_type`` is registered in HF ``CONFIG_MAPPING`` the corresponding
-    config class is used; otherwise we fall back to a generic
-    ``PretrainedConfig`` so all dict keys still become real attributes (M3's
-    text backbone uses ``model_type="minimax_m2"`` which is not in
-    ``CONFIG_MAPPING``).
+    Unknown ``model_type`` (e.g. M3's ``minimax_m2``, absent from
+    ``CONFIG_MAPPING``) falls back to ``PretrainedConfig`` so dict keys
+    still become real attributes.
     """
     if not isinstance(sub_config, dict):
         return sub_config
@@ -26,12 +23,6 @@ def _coerce_sub_config(
 
 
 class MiniMaxVLBaseConfig(PretrainedConfig):
-    """Base config for the MiniMax VL family.
-
-    Handles vision/text sub-config coercion. Concrete subclasses only need to
-    declare a unique ``model_type`` string.
-    """
-
     def __init__(
         self,
         vision_config: Optional[dict] = None,
@@ -66,6 +57,4 @@ class MiniMaxVLBaseConfig(PretrainedConfig):
 
 
 class MiniMaxM3VLConfig(MiniMaxVLBaseConfig):
-    """MiniMax M3 VL: vision tower + M3 (mixed sparse/dense MoE) text backbone."""
-
     model_type = "minimax_m3_vl"
