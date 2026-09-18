@@ -72,7 +72,6 @@ class Device(msgspec.Struct):
         bool,
         "Use Ray actors for scheduler process management.",
     ] = False
-    custom_sigquit_handler: Optional[Callable] = None
     numa_node: A[
         Optional[List[int]],
         "Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
@@ -82,4 +81,4 @@ class Device(msgspec.Struct):
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
     ] = None
     # --- local (kt fork) fields preserved across the V4.1 port ---
-    custom_sigquit_handler: A[Optional[Callable]] = None
+    custom_sigquit_handler: A[Optional[Callable], "Custom SIGQUIT handler for graceful shutdown."] = None

@@ -197,7 +197,6 @@ class Observability(msgspec.Struct):
     # read from this map and fall back to the base class. Class-object only (no
     # CLI surface) since this exists for embedded use cases that pass a Python
     # class directly. Default None preserves existing behavior.
-    stat_loggers: Optional[Dict[str, type]] = None
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -253,4 +252,4 @@ class Observability(msgspec.Struct):
     # CLI surface) since this exists for embedded use cases that pass a Python
     # class directly. Default None preserves existing behavior.
     # --- local (kt fork) fields preserved across the V4.1 port ---
-    stat_loggers: A[Optional[Dict[str, type]]] = None
+    stat_loggers: A[Optional[Dict[str, type]], "stat logger name -> logger class"] = None
