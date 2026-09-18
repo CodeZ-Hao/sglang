@@ -1802,6 +1802,95 @@ class Envs:
     )
 
 
+    # --- local (kt fork) env vars preserved across the V4.1 port ---
+    SGLANG_CUTLASS_MOE = EnvBool(False)
+    SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    SGLANG_DSV4_2604_SUBMODE = EnvStr("")
+        # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
+        # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
+    SGLANG_DSV4_CPP_ATTN = EnvBool(False)
+    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
+        # Chunk size for the rebalance expert-weight P2P exchange; set
+        # >= num_physical_experts to submit a single batch_isend_irecv.
+    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
+        # ====================================================================
+    
+        # ====================================================================
+        # Inkling
+    SGLANG_FUSED_INDEXER = EnvBool(True)
+    
+        # CUDA kernels
+    SGLANG_INDEXER_COMPILE = EnvBool(True)
+    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    
+        # MTHREADS & MUSA
+    SGLANG_OPT_CUDA_SWA_RING = EnvBool(False)
+    
+        # Unified radix cache
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+        # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
+        # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
+        # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
+        # this combination on the host side.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+    
+        # TopK
+    SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(False)
+    SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(False)
+    SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(False)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+        # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
+        # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
+        # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
+        # instead of quantizing the same [T, hidden] tensor twice with different
+        # scale layouts. Only engages on CUDA with fp8 block-128 weights, the
+        # standard dispatcher, and the triton MoE runner; falls back silently
+        # otherwise.
+    SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+        # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
+        # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
+        # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
+        # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
+    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
+    SGLANG_PD_CPU_PREFILL = EnvBool(False)
+    SGLANG_PD_PARALLEL = EnvBool(False)
+        # PD-parallel CPU-AMX prefill channel (decode during GPU prefill plus a
+        # second prefill of the next waiting request on the CPU AMX path). Default
+        # off: two concurrent prefill forwards race the DeepSeekV4 compression
+        # metadata pipeline even with a per-thread attention backend.
+    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+    
+        # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+        # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+    SGLANG_SM8X_ATTN_COMPILE = EnvBool(False)
+    SGLANG_SM8X_FUSED_ATTN = EnvBool(True)
+    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+        # Periodically log lazy-compaction stats per sub-pool (observability only).
+    SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
+    
+        # Model & File Download
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+
+
+
 envs = Envs()
 EnvField._allow_set_name = False
 
