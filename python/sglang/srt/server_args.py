@@ -250,6 +250,19 @@ class ServerArgs:
         resolve it itself -- stays raw.
         """
 
+    def get_hf_config(self):
+        """HF config for the configured model (kt fork helper, cached)."""
+        import json
+
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        return get_config(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.revision,
+            model_override_args=json.loads(self.json_model_override_args),
+        )
+
     def resolve_once(self) -> None:
         """Run the resolution pipeline, unless this record has been through it.
 
