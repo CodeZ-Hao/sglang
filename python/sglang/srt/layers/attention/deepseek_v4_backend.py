@@ -3809,10 +3809,13 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
-            if self.cuda_capability[0] == 8 and (
-                self.is_dspark_draft
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_extend_without_speculative()
+            if (
+                torch.cuda.get_device_capability()[0] == 8
+                and (
+                    self.is_dspark_draft
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_extend_without_speculative()
+                )
             ):
                 # SM8x (kt fork): dequantize the SWA window (+ optional
                 # compressed c4/c128 window) and run BF16 tensor-core
