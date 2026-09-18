@@ -15,7 +15,6 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -292,6 +291,7 @@ class DeepseekMLAForwardMixin:
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
