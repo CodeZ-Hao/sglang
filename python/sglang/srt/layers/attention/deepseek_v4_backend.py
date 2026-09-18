@@ -3809,6 +3809,28 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
+            if self.cuda_capability[0] == 8 and (
+                self.is_dspark_draft
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_extend_without_speculative()
+            ):
+                # SM8x (kt fork): dequantize the SWA window (+ optional
+                # compressed c4/c128 window) and run BF16 tensor-core
+                # attention. FlashMLA sparse decode/prefill kernels are
+                # Hopper-only, so sgl_kernel 0.4.5 raises
+                # "Unsupported architecture for sparse decode fwd" here.
+                return self._forward_dspark_sm8x_swa(
+                    q=q,
+                    quant_k_cache=swa_k_cache_raw,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    page_size=token_to_kv.swa_window_size,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
+
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
             assert swa_page_indices.shape[-1] % 64 == 0, (
@@ -4458,6 +4480,147 @@ class DeepseekV4AttnBackend(
         return swa_page_indices, swa_topk_lengths
 
 
+    def _forward_dspark_sm8x_swa(
+        self,
+        *,
+        q: torch.Tensor,
+        quant_k_cache: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        page_size: int,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor] = None,
+        extra_indices: Optional[torch.Tensor] = None,
+        extra_topk_length: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Ada/Ampere DSpark SWA over the native packed DSV4 KV cache.
+
+        FlashMLA's sparse decode kernel is Hopper-only. On SM8x, keep the
+        compact FP8-nope/BF16-rope cache, dequantize only the selected window
+        (SWA + optional compressed c4/c128), and use BF16 tensor-core batch
+        matmuls for attention.
+        """
+        if q.ndim == 4:
+            q = q.squeeze(1)
+        if indices.ndim == 3:
+            indices = indices.squeeze(1)
+        if extra_indices is not None and extra_indices.ndim == 3:
+            extra_indices = extra_indices.squeeze(1)
+
+        if envs.SGLANG_SM8X_FUSED_ATTN.get() and q.shape[-1] == 512:
+            from sglang.kernels.ops.attention.dsv4.fused_sm8x_fp8_attn import (
+                fused_sm8x_fp8_attn,
+            )
+
+            return fused_sm8x_fp8_attn(
+                q=q,
+                swa_cache=quant_k_cache,
+                swa_indices=indices,
+                swa_topk_lengths=topk_length,
+                swa_page_size=page_size,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+                extra_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_length,
+                extra_page_size=(
+                    extra_k_cache.shape[1]
+                    if extra_k_cache is not None and extra_indices is not None
+                    else 0
+                ),
+            )
+
+        num_q = indices.shape[0]
+        # Chunk over queries so the eagerly dequantized window workspace is
+        # bounded. The full-window dequant for a large prefill batch can reach
+        # ~1 GiB, which OOMs when the KV pool is large (small headroom).
+        chunk = _SM8X_ATTN_CHUNK
+        use_compiled = (
+            num_q > 32
+            and envs.SGLANG_SM8X_ATTN_COMPILE.get()
+            and _sm8x_attn_chunk_compiled is not None
+        )
+        if use_compiled and num_q <= chunk:
+            return _sm8x_attn_chunk_compiled(
+                q=q,
+                quant_k_cache=quant_k_cache,
+                indices=indices,
+                topk_length=topk_length,
+                page_size=page_size,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                softmax_scale=self.softmax_scale,
+                head_dim=self.model_runner.model_config.head_dim,
+            )
+        if num_q <= chunk:
+            return self._forward_dspark_sm8x_swa_chunk(
+                q=q,
+                indices=indices,
+                topk_length=topk_length,
+                page_size=page_size,
+                attn_sink=attn_sink,
+                quant_k_cache=quant_k_cache,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+            )
+        outs = []
+        for start in range(0, num_q, chunk):
+            stop = min(start + chunk, num_q)
+            outs.append(
+                self._forward_dspark_sm8x_swa_chunk(
+                    q=q[start:stop],
+                    indices=indices[start:stop],
+                    topk_length=topk_length[start:stop],
+                    page_size=page_size,
+                    attn_sink=attn_sink,
+                    quant_k_cache=quant_k_cache,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=(
+                        None
+                        if extra_indices is None
+                        else extra_indices[start:stop]
+                    ),
+                    extra_topk_length=(
+                        None
+                        if extra_topk_length is None
+                        else extra_topk_length[start:stop]
+                    ),
+                )
+            )
+        return torch.cat(outs, dim=0)
+
+    def _forward_dspark_sm8x_swa_chunk(
+        self,
+        *,
+        q: torch.Tensor,
+        quant_k_cache: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        page_size: int,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor] = None,
+        extra_indices: Optional[torch.Tensor] = None,
+        extra_topk_length: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return _sm8x_attn_chunk_fn(
+            q=q,
+            quant_k_cache=quant_k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            page_size=page_size,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_topk_length,
+            softmax_scale=self.softmax_scale,
+            head_dim=self.model_runner.model_config.head_dim,
+        )
+
+
+
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
@@ -4582,3 +4745,86 @@ def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
             ],
             dim=0,
         )
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+# FlashInfer 0.6.15 SM120 DSV4 standalone-decode instantiations.  The prefill
+# path also supports these widths, while 192 (the natural DSpark width for a
+# 128-token SWA window plus a six-token draft block) is unsupported.
+_SM120_FLASHINFER_DSV4_TOPKS = (128, 512, 1024)
+
+
+def _dspark_swa_page_index_alignment(block_size: int) -> int:
+    """Choose a DSpark index width accepted by the selected SM120 backend."""
+    is_sm120 = _is_cuda and torch.cuda.get_device_capability()[0] == 12
+    if not (
+        is_sm120 and envs.SGLANG_SM120_FLASHMLA_BACKEND.get().lower() == "flashinfer"
+    ):
+        return PAGE_INDEX_ALIGNED_SIZE
+
+    required_topk = SWA_WINDOW + block_size
+    for flashinfer_topk in _SM120_FLASHINFER_DSV4_TOPKS:
+        if required_topk <= flashinfer_topk:
+            return flashinfer_topk
+    raise ValueError(
+        "DSpark's sparse-attention width exceeds the FlashInfer SM120 DSV4 "
+        f"decode envelope: required_topk={required_topk}, supported_topk="
+        f"{_SM120_FLASHINFER_DSV4_TOPKS}. Set "
+        "SGLANG_SM120_FLASHMLA_BACKEND=triton for larger draft blocks."
+    )
+
+def _sm8x_attn_chunk_fn(
+    *,
+    q: torch.Tensor,
+    quant_k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    page_size: int,
+    attn_sink: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+    head_dim: int,
+) -> torch.Tensor:
+    """Pure-tensor SM8x SWA chunk kernel body.
+
+    Dequantizes the selected SWA (+ c4/c128) window, then runs the scores +
+    softmax (with sink) + output through the fused Triton kernel (one launch
+    instead of ~10 eager ops).
+    """
+    num_q, topk = indices.shape
+    from sglang.kernels.ops.attention.dsv4.fused_sm8x_attn import (
+        fused_sm8x_attn,
+        sm8x_indices_prep,
+    )
+
+    valid, safe_indices = sm8x_indices_prep(indices, topk_length)
+    kv = dequantize_k_cache_paged(
+        quant_k_cache,
+        safe_indices.reshape(-1).contiguous(),
+        page_size=page_size,
+    ).view(num_q, topk, head_dim)
+
+    if extra_k_cache is not None and extra_indices is not None:
+        e_num_q, e_topk = extra_indices.shape
+        extra_valid, e_safe = sm8x_indices_prep(extra_indices, extra_topk_length)
+        extra_k_2d = extra_k_cache.reshape(extra_k_cache.shape[0], -1).contiguous()
+        extra_kv = dequantize_k_cache_paged(
+            extra_k_2d,
+            e_safe.reshape(-1).contiguous(),
+            page_size=extra_k_cache.shape[1],
+        ).view(e_num_q, e_topk, head_dim)
+        if e_num_q != num_q:
+            if e_num_q < num_q:
+                extra_kv = _pad_tensor_to_size(extra_kv, num_q, value=0)
+                extra_valid = _pad_tensor_to_size(extra_valid, num_q, value=False)
+            else:
+                extra_kv = extra_kv[:num_q]
+                extra_valid = extra_valid[:num_q]
+            e_num_q = num_q
+        kv = torch.cat((kv, extra_kv), dim=1)
+        valid = torch.cat((valid, extra_valid), dim=1)
+
+    sink = attn_sink.view(-1)
+    return fused_sm8x_attn(q, kv, valid, sink, softmax_scale)
