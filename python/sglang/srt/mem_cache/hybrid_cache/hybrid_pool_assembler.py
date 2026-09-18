@@ -2357,8 +2357,12 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from typing import TYPE_CHECKING as _TC
+if _TC:
+    from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+
 def attach_hybrid_pool_to_mamba_cache(
-    mamba_cache: HiMambaRadixCache,
+    mamba_cache: "HiMambaRadixCache",
     params: CacheInitParams,
     server_args: ServerArgs,
     *,

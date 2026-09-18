@@ -181,17 +181,3 @@ class EVS(torch.nn.Module, ABC):
             embedding=final_embeddings_tensor,
             num_tokens_per_frame=num_tokens_per_frame,
         )
-
-
-# --- local (kt fork) definitions preserved across the V4.1 port ---
-@dataclasses.dataclass(kw_only=True)
-class VideoEVSDataItem(EVSDataItem):
-    pre_chunked_input_ids: torch.Tensor
-
-    def __post_init__(self):
-        assert self.is_video()
-
-
-@dataclasses.dataclass(kw_only=True)
-class EVSDataItem(MultimodalDataItem):
-    thw_grids: list[tuple[int, int, int]]

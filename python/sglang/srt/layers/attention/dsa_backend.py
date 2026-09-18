@@ -3854,6 +3854,8 @@ NSAIndexerMetadata = DSAIndexerMetadata
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from sglang.srt.layers.cp.utils import is_cp_v2_active
+
 def materialize_full_kv_cp(
     attn_mla,
     forward_batch: ForwardBatch,

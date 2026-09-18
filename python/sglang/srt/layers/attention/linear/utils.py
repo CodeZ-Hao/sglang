@@ -139,6 +139,8 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from sglang.srt.server_args import ServerArgs
+
 def initialize_linear_attn_config(server_args: ServerArgs):
     global LINEAR_ATTN_DECODE_BACKEND
     global LINEAR_ATTN_PREFILL_BACKEND

@@ -1751,6 +1751,9 @@ def is_aborted(req: Req) -> bool:
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+import sglang.srt.utils as _sgl_utils
+_IS_HIP = _sgl_utils.is_hip()
+
 def get_dsv4_c128_state_indices(
     req_pool_idx: int,
     seq_len: int,

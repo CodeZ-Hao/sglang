@@ -1969,6 +1969,8 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from sglang.srt.utils.common import is_sm120 as is_sm120_supported
+
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
     weight-resolved dtypes): validated against the resolvable whitelist, then

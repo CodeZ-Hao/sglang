@@ -252,6 +252,9 @@ def fp8_mqa_logits_make_fused_kv(
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from typing import List, Union
+from sglang.srt.runtime_context import get_server_args
+
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.

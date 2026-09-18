@@ -10,6 +10,8 @@ from typing import NamedTuple
 import torch
 
 from sglang.srt.environ import envs
+
+DISABLE_KT_EP_WRAPPER = False
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -968,6 +970,8 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+from sglang.srt.environ import envs
+
 def is_kt_ep_wrapper_disabled() -> bool:
     """Check if KT EP wrapper is disabled (for draft models in speculative decoding)."""
     global DISABLE_KT_EP_WRAPPER

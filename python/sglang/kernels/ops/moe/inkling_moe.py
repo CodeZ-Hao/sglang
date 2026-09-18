@@ -1020,6 +1020,12 @@ def grouped_gemm_triton(
 
 
 # --- local (kt fork) definitions preserved across the V4.1 port ---
+import helion
+import helion.language as hl
+from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
+    helion_aot_autotune,
+)
+
 def silu_and_mul_helion(
     gateup_output: torch.Tensor,
     topk_weights: torch.Tensor | None = None,
