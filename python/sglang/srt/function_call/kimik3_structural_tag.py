@@ -1,23 +1,51 @@
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from xgrammar import StructuralTag
-from xgrammar.structural_tag import (
+from xgrammar.structural_tag import (  # noqa: F401
     AnyTextFormat,
-    AnyTokensFormat,
     ConstStringFormat,
-    ExcludeTokenFormat,
     Format,
     JSONSchemaFormat,
-    OptionalFormat,
     OrFormat,
     RegexFormat,
     SequenceFormat,
-    StarFormat,
     TagFormat,
     TagsWithSeparatorFormat,
-    TokenFormat,
     TriggeredTagsFormat,
 )
+
+try:  # xgrammar >= new API
+    from xgrammar.structural_tag import (
+        AnyTokensFormat,
+        ExcludeTokenFormat,
+        OptionalFormat,
+        StarFormat,
+        TokenFormat,
+    )
+except ImportError:  # older xgrammar: approximate the missing formats
+    class AnyTokensFormat(Format):  # type: ignore[no-redef]
+        """Fallback: any tokens (regex dot-star approximation)."""
+
+        def __init__(self, exclude: Optional[Set[int]] = None) -> None:
+            super().__init__(RegexFormat(r".*"))
+
+    class ExcludeTokenFormat(Format):  # type: ignore[no-redef]
+        """Fallback: accept everything except the given tokens (approximated)."""
+
+        def __init__(self, exclude: Optional[Set[int]] = None) -> None:
+            super().__init__(RegexFormat(r".*"))
+
+    class OptionalFormat(Format):  # type: ignore[no-redef]
+        def __init__(self, content: Format) -> None:
+            super().__init__(OrFormat(RegexFormat(r""), content))
+
+    class StarFormat(Format):  # type: ignore[no-redef]
+        def __init__(self, content: Format) -> None:
+            super().__init__(RegexFormat(r".*"))
+
+    class TokenFormat(Format):  # type: ignore[no-redef]
+        def __init__(self, token: str) -> None:
+            super().__init__(RegexFormat(token))
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.kimik3_format import (
