@@ -22,30 +22,24 @@ try:  # xgrammar >= new API
         StarFormat,
         TokenFormat,
     )
-except ImportError:  # older xgrammar: approximate the missing formats
-    class AnyTokensFormat(Format):  # type: ignore[no-redef]
+except ImportError:  # older xgrammar: approximate the missing formats with regex
+
+    def AnyTokensFormat(exclude=None) -> Format:  # type: ignore[misc]
         """Fallback: any tokens (regex dot-star approximation)."""
+        return RegexFormat(r".*")
 
-        def __init__(self, exclude: Optional[Set[int]] = None) -> None:
-            super().__init__(RegexFormat(r".*"))
-
-    class ExcludeTokenFormat(Format):  # type: ignore[no-redef]
+    def ExcludeTokenFormat(exclude=None) -> Format:  # type: ignore[misc]
         """Fallback: accept everything except the given tokens (approximated)."""
+        return RegexFormat(r".*")
 
-        def __init__(self, exclude: Optional[Set[int]] = None) -> None:
-            super().__init__(RegexFormat(r".*"))
+    def OptionalFormat(content: Format) -> Format:  # type: ignore[misc]
+        return OrFormat(RegexFormat(r""), content)
 
-    class OptionalFormat(Format):  # type: ignore[no-redef]
-        def __init__(self, content: Format) -> None:
-            super().__init__(OrFormat(RegexFormat(r""), content))
+    def StarFormat(content: Format) -> Format:  # type: ignore[misc]
+        return RegexFormat(r".*")
 
-    class StarFormat(Format):  # type: ignore[no-redef]
-        def __init__(self, content: Format) -> None:
-            super().__init__(RegexFormat(r".*"))
-
-    class TokenFormat(Format):  # type: ignore[no-redef]
-        def __init__(self, token: str) -> None:
-            super().__init__(RegexFormat(token))
+    def TokenFormat(token: str) -> Format:  # type: ignore[misc]
+        return RegexFormat(token)
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.kimik3_format import (
