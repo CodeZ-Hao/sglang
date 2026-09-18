@@ -595,10 +595,25 @@ class _HostTable:
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
 
+    @staticmethod
+    def _memfd_create(name: str) -> int:
+        try:
+            return os.memfd_create(name, 0)
+        except AttributeError:
+            # os.memfd_create missing (e.g. py3.11 builds without it): syscall 319
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            MFD_CLOEXEC = 1
+            fd = libc.syscall(319, ctypes.c_char_p(name.encode()), ctypes.c_uint(MFD_CLOEXEC))
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "memfd_create syscall failed")
+            return fd
+
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
         if self.group.rank_in_group == 0:
-            fd = os.memfd_create(name, 0)
+            fd = self._memfd_create(name)
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
         pid, owner_fd = self.group.broadcast_object(owner, src=0)
