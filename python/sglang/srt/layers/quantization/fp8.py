@@ -433,11 +433,20 @@ class Fp8Config(QuantizationConfig):
                 return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
-                from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
-                    Mxfp4MarlinMoEMethod,
+                if get_platform().is_sm90 or get_platform().is_sm120:
+                    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                        Mxfp4MarlinMoEMethod,
+                    )
+
+                    return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+                # SM8x (e.g. SM89 RTX 4080): the Marlin path is gated to
+                # SM90/SM120 upstream; route through the DSV4 triton kernels
+                # instead (same choice the kt fork made for V4-Flash).
+                from sglang.srt.layers.quantization.mxfp4_deepseek import (
+                    DeepSeekMxfp4MoEMethod,
                 )
 
-                return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+                return DeepSeekMxfp4MoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_humming():
                 from sglang.srt.layers.quantization.mxfp4_humming_moe import (
