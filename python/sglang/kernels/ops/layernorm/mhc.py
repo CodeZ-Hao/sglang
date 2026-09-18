@@ -1068,10 +1068,14 @@ def mhc_pre(
                 hidden_block = 256
             elif hc_hidden_size == 28672:
                 hidden_block = 128
+            elif hc_hidden_size % 256 == 0:
+                # V4.1 (hidden 5120 x hc_mult 4 = 20480) and any other
+                # 256-multiple layout: 128 keeps every divisor valid.
+                hidden_block = 128
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
+                    f"mhc_pre splitk kernel requires hc_hidden_size divisible "
+                    f"by 256, got {hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,
