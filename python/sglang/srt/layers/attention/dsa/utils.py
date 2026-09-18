@@ -249,3 +249,65 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+    """
+    # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
+    |   +-----------before split------------+|
+    | token0, token1, token2, token3, token4, token5, token6, token7, ...
+    |
+    |   +--------------result-------------------+
+    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
+    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
+    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
+    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
+    |   +-------------------------+
+    """
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    if isinstance(input_, (tuple, list)):
+        indices = range(cp_rank, len(input_), cp_size)
+        return input_[indices]
+
+    tokens = len(input_)
+    if tokens % cp_size != 0:
+        cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
+        if cur_len == 0:
+            return input_.new_empty(0, *input_.shape[1:])
+        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
+        return input_[indices]
+
+    # for torch device tensor
+    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+
+
+def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+
+    if is_dsa_prefill_cp_round_robin_split():
+        cur_cp_seq_len = seq_len // cp_size
+        assert (
+            seq_len % cp_size == 0
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+    else:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+        # the seq data needs to be divided and recombined at twice the size of cp_size.
+        cur_cp_seq_len = seq_len // (cp_size * 2)
+    return cur_cp_seq_len != 0
+
+
+def is_dsa_prefill_cp_round_robin_split():
+    return (
+        is_dsa_enable_prefill_cp()
+        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+    )

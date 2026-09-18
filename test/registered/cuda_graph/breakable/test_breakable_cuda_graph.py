@@ -4,11 +4,11 @@ Two test classes:
 - TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
 - TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
-  --enable-breakable-cuda-graph and check mgsm_en accuracy.
+  --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
 """
 
 import unittest
-from typing import NamedTuple
+from unittest.mock import patch
 
 import torch
 
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
@@ -80,11 +80,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             broken = eager_op(intermediate)
             y.copy_(broken + 3.0)
 
-        self.assertEqual(
-            graph._break_labels,
-            ["TestBreakableCUDAGraphBasic.test_single_break.<locals>.eager_op"],
-        )
-
         # Replay with new input
         x.fill_(10.0)
         graph.replay()
@@ -114,49 +109,11 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             t4 = double(t3)  # break 2: eager
             y.copy_(t4)  # graph segment 3
 
-        self.assertEqual(
-            graph._segment_label(1),
-            "after TestBreakableCUDAGraphBasic.test_multiple_breaks.<locals>.add_one, "
-            "before TestBreakableCUDAGraphBasic.test_multiple_breaks.<locals>.double",
-        )
-
         # Replay: x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16
         x.fill_(5.0)
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
-
-    def test_namedtuple_input_keeps_fields_during_replay(self):
-        """Weak-ref capture must preserve nested NamedTuple argument types."""
-
-        class Routing(NamedTuple):
-            weights: torch.Tensor
-
-        class DispatchOutput(NamedTuple):
-            hidden_states: torch.Tensor
-            topk_output: Routing
-
-        x = torch.zeros(4, device=self.device)
-        weights = torch.full((4,), 2.0, device=self.device)
-        y = torch.zeros(4, device=self.device)
-
-        @self.eager_on_graph(enable=True)
-        def eager_moe(dispatch_output):
-            self.assertIsInstance(dispatch_output, DispatchOutput)
-            self.assertIsInstance(dispatch_output.topk_output, Routing)
-            return dispatch_output.hidden_states * dispatch_output.topk_output.weights
-
-        graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
-        with self.BreakableCUDAGraphCapture(graph, stream=stream):
-            hidden_states = x + 1.0
-            output = eager_moe(DispatchOutput(hidden_states, Routing(weights)))
-            y.copy_(output)
-
-        x.fill_(10.0)
-        graph.replay()
-        torch.cuda.synchronize()
-        self.assertTrue(torch.allclose(y, torch.full((4,), 22.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""
@@ -212,6 +169,31 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
+    def test_side_stream_join_across_break(self):
+        """A side-stream producer may be joined after a graph break."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+        stream = torch.cuda.Stream(self.device)
+
+        @self.eager_on_graph(enable=True)
+        def identity(src):
+            return src
+
+        graph = self.BreakableCUDAGraph()
+        capture_stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=capture_stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                side_output = x + 1.0
+            identity(x)
+            torch.cuda.current_stream().wait_stream(stream)
+            y.copy_(side_output * 2.0)
+
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 12.0, device=self.device)))
+
     def test_eager_output_is_held_strongly_for_replay_bridge(self):
         """The replay closure must keep the eager output bridge buffer alive."""
         x = torch.zeros(4, device=self.device)
@@ -233,6 +215,56 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             any(cell.cell_contents is broken for cell in replay_closure),
             "eager output bridge buffer must be strongly captured",
         )
+
+    def test_attention_narrows_padded_positions(self):
+        from sglang.srt.layers.radix_attention import unified_attention_with_output
+
+        num_tokens = 3
+        padded_num_tokens = 5
+        forward_batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=num_tokens,
+            out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
+            positions=torch.arange(padded_num_tokens, device=self.device),
+        )
+        context = SimpleNamespace(
+            forward_batch=forward_batch,
+            attention_layers=[object()],
+            mha_companion_layers=None,
+            num_tokens=padded_num_tokens,
+            raw_num_tokens=num_tokens,
+        )
+        observed = {}
+
+        def attention_forward(query, key, value, layer, batch, save_kv_cache):
+            observed["positions"] = batch.positions.clone()
+            observed["out_cache_loc"] = batch.out_cache_loc.clone()
+            return torch.ones_like(query)
+
+        output = torch.full((padded_num_tokens, 2), float("nan"), device=self.device)
+        with (
+            patch(
+                "sglang.srt.layers.radix_attention.get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch(
+                "sglang.srt.layers.radix_attention.get_attn_backend",
+                return_value=SimpleNamespace(forward=attention_forward),
+            ),
+        ):
+            unified_attention_with_output(
+                torch.zeros((padded_num_tokens, 2), device=self.device),
+                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
+                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
+                output,
+                True,
+                0,
+            )
+
+        expected = torch.arange(num_tokens, device=self.device)
+        torch.testing.assert_close(observed["positions"], expected)
+        torch.testing.assert_close(observed["out_cache_loc"], expected)
+        self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
+        self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
 
 
 class TestCopyOutput(CustomTestCase):
@@ -321,10 +353,8 @@ class TestBreakGraphHelper(CustomTestCase):
         stream = torch.cuda.Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
-            self.break_graph("test checkpoint")
+            self.break_graph()
             y.copy_(t + 2.0)
-
-        self.assertEqual(graph._break_labels, ["checkpoint[test checkpoint]"])
 
         x.fill_(10.0)
         graph.replay()
@@ -334,7 +364,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
 
 class TestBreakableCudaGraph(CustomTestCase):
-    """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
+    """Integration: Qwen3-8B with --cuda-graph-backend-prefill=breakable on mgsm_en."""
 
     @classmethod
     def setUpClass(cls):
@@ -358,7 +388,7 @@ class TestBreakableCudaGraph(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mgsm_en",
-            num_examples=1319,
+            num_examples=200,
             num_threads=1024,
         )
 

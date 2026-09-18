@@ -1761,3 +1761,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+# Module-level flag consulted by lora_manager before wrapping the DSA indexer.
+# The indexer itself now tracks this per instance (self.use_dsa_indexer_fusion);
+# the global stays False so LoRA validation takes the conservative path.
+_use_dsa_indexer_fusion = False

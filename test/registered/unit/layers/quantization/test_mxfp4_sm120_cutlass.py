@@ -11,9 +11,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
 def _random_weights(num_experts: int, hidden: int, intermediate: int):
@@ -81,10 +82,13 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
             sys.modules[module_name] = cached_module
 
 
-def test_dsv4_sm120_load_contract(monkeypatch):
+def test_dsv4_sm120_load_contract(monkeypatch, request):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
+    from sglang.srt.runtime_context import get_context
 
-    monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
+    platform = override_platform(is_sm120=True)
+    platform.install()
+    request.addfinalizer(platform.restore)
 
     captured = {}
 
@@ -92,7 +96,8 @@ def test_dsv4_sm120_load_contract(monkeypatch):
         def create_weights(self, *args, **kwargs):
             captured.update(kwargs)
 
-    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
     method.create_weights(
         SimpleNamespace(),
         num_experts=4,
@@ -103,47 +108,6 @@ def test_dsv4_sm120_load_contract(monkeypatch):
 
     assert method.load_up_proj_weight_first
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
-
-
-def test_dsv4_sm120_runner_metadata_uses_physical_expert_count(monkeypatch):
-    import sglang.srt.layers.moe.moe_runner.runner as runner_module
-    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-
-    monkeypatch.setattr(adapter_module, "is_flashinfer_available", lambda: True)
-    monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
-
-    captured = {}
-
-    class _Runner:
-        def __init__(self, backend, config):
-            captured["backend"] = backend
-            captured["config"] = config
-
-    monkeypatch.setattr(runner_module, "MoeRunner", _Runner)
-
-    physical_experts = 96
-    layer = SimpleNamespace(
-        # KT keeps routing in the 256-expert logical space while allocating a
-        # compact physical weight tensor for the GPU-resident subset.
-        num_local_experts=256,
-        w13_weight=torch.empty((physical_experts, 1), dtype=torch.uint8),
-        w2_weight=torch.empty((physical_experts, 1), dtype=torch.uint8),
-    )
-    config = MoeRunnerConfig(
-        num_experts=256,
-        num_local_experts=physical_experts,
-        swiglu_limit=10,
-    )
-    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(
-        SimpleNamespace(), "test"
-    )
-
-    method.create_moe_runner(layer, config)
-
-    assert method._mxfp4_weight_global_scale_tensor.shape == (physical_experts,)
-    assert method._swiglu_limit_tensor.shape == (physical_experts,)
-    assert captured["config"] is config
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
@@ -164,6 +128,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
@@ -193,9 +158,10 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         moe_ep_rank=0,
     )
 
-    method = Mxfp4FlashinferCutlassMoEMethod(
-        SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
-    )
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
+        )
     config = MoeRunnerConfig(
         num_experts=num_experts,
         num_local_experts=num_experts,

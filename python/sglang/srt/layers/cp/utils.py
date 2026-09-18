@@ -349,3 +349,45 @@ __all__ = [
     "get_layer_shard_range",
     "get_layer_owner",
 ]
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+def is_cp_v2_active(forward_batch) -> bool:
+    """Return whether the current forward batch is running through CP-v2."""
+    if not enable_cp_v2():
+        return False
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+        return False
+
+    strategy = get_cp_strategy()
+    if strategy is None:
+        return False
+
+    input_ids = getattr(forward_batch, "input_ids", None)
+    if input_ids is None:
+        return False
+
+    return strategy.can_apply(len(input_ids), forward_batch)
+
+
+def enable_cp_v2() -> bool:
+    """Return whether the CP-v2 path is enabled for this process."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_ENABLE_CP_V2.get())
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+
+CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
+    {
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "GptOssForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "DeepseekV3ForCausalLM",
+    }
+)

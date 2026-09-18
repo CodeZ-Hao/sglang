@@ -965,3 +965,10 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+def is_kt_ep_wrapper_disabled() -> bool:
+    """Check if KT EP wrapper is disabled (for draft models in speculative decoding)."""
+    global DISABLE_KT_EP_WRAPPER
+    return DISABLE_KT_EP_WRAPPER

@@ -136,3 +136,18 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
             ]
         )
     return indices
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+def initialize_linear_attn_config(server_args: ServerArgs):
+    global LINEAR_ATTN_DECODE_BACKEND
+    global LINEAR_ATTN_PREFILL_BACKEND
+
+    base = server_args.linear_attn_backend
+    decode = server_args.linear_attn_decode_backend or base
+    prefill = server_args.linear_attn_prefill_backend or base
+
+    LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
+    LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
+
+    rank0_log(f"Linear attention kernel backend: decode={decode}, prefill={prefill}")

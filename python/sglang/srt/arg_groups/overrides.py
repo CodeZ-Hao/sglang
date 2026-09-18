@@ -1966,3 +1966,73 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
     if getattr(server_args, "_resolution_finished", False):
         server_args._max_speculative_num_draft_tokens = result
     return result
+
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
+    """Declare a load-time resolved field (model-file config overrides,
+    weight-resolved dtypes): validated against the resolvable whitelist, then
+    written to the config bags via ``get_context().override``; ``server_args``
+    stays the pristine startup record."""
+    from sglang.srt.runtime_context import get_context
+
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    context.override(source, **declared)
+
+
+@register_post_process
+def _attention_backend_dual_chunk(view: Any) -> dict:
+    if (
+        getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
+        is not None
+    ):
+        if view.attention_backend is None:
+            logger.info("Dual chunk attention is turned on by default.")
+            return {"attention_backend": "dual_chunk_flash_attn"}
+        elif view.attention_backend != "dual_chunk_flash_attn":
+            raise ValueError(
+                "Dual chunk attention is enabled, but attention backend is set to "
+                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+            )
+    return {}
+
+
+def _cutlass_moe_env_override(view: Any) -> dict:
+
+    if envs.SGLANG_CUTLASS_MOE.get():
+        logger.warning(
+            "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
+        )
+        assert view.quantization in [
+            "fp8",
+            "mxfp8",
+        ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
+        return {"moe_runner_backend": "cutlass"}
+    return {}
+
+
+@register_post_process
+def _deepseek_v4_sm120_moe(view: Any) -> dict:
+    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
+    hf_config = view.get_model_config().hf_config
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
+        return {}
+    if is_sm120_supported() and view.moe_runner_backend == "auto":
+        logger.info(
+            "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
+    return {}
+
+
+def materialize_declarations(server_args: Any) -> None:
+    """Apply the accumulated declarations onto ``server_args`` once, at the
+    end of ``__post_init__`` (gate order: last writer wins). After this the
+    fields carry the resolved configuration — every post-init reader, in any
+    process, reads them directly; ``resolved_view`` remains an internal
+    helper for mid-resolution code only."""
+    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        for field, value in declared.items():
+            setattr(server_args, field, value)
+    server_args._declarations_materialized = True

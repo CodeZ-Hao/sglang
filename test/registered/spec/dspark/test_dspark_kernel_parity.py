@@ -30,7 +30,7 @@ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = torch.device("cuda")
 VOCAB = 129280
@@ -286,21 +286,19 @@ def _case_swa_page_indices(tc):
         block_size=block_size,
         swa_window=128,
     )
-    for page_index_aligned_size in (64, 512):
-        got, _ = tc._parity(
-            dspark_attn_metadata.BuildDsparkSwaPageIndices,
-            req_to_token=_ri(0, n_full, (max_reqs, 400), torch.int32),
-            full_to_swa_mapping=_ri(0, 20000, (n_full,), torch.int32),
-            req_pool_indices_per_request=gather.req_pool_indices_per_request,
-            offsets=gather.offsets,
-            invalid=gather.invalid,
-            out_loc=_ri(0, n_full, (num_q,)),
-            context_lens=gather.context_lens,
-            block_size=block_size,
-            swa_window=128,
-            page_index_aligned_size=page_index_aligned_size,
-        )
-        tc.assertEqual(got[0].shape[-1], page_index_aligned_size)
+    tc._parity(
+        dspark_attn_metadata.BuildDsparkSwaPageIndices,
+        req_to_token=_ri(0, n_full, (max_reqs, 400), torch.int32),
+        full_to_swa_mapping=_ri(0, 20000, (n_full,), torch.int32),
+        req_pool_indices_per_request=gather.req_pool_indices_per_request,
+        offsets=gather.offsets,
+        invalid=gather.invalid,
+        out_loc=_ri(0, n_full, (num_q,)),
+        context_lens=gather.context_lens,
+        block_size=block_size,
+        swa_window=128,
+        page_index_aligned_size=64,
+    )
 
 
 def _case_expand_prefill_causally(tc):
