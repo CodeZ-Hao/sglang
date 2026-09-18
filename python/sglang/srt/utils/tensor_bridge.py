@@ -436,3 +436,22 @@ __all__ = [
     "mlx_to_torch",
     "torch_to_mlx",
 ]
+
+# --- local (kt fork) definitions preserved across the V4.1 port ---
+# use_mlx/is_mlx_available moved to hardware_backend.mlx.runtime in the
+# official tree; re-export from here for the callers that still import
+# them from tensor_bridge (e.g. kernels/ops/diffusion mps_fallback).
+def is_mlx_available() -> bool:
+    try:
+        from sglang.srt.hardware_backend.mlx.runtime import is_mlx_available as _impl
+        return _impl()
+    except Exception:
+        return False
+
+
+def use_mlx() -> bool:
+    try:
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx as _impl
+        return _impl()
+    except Exception:
+        return False
