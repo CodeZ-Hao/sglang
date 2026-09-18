@@ -284,3 +284,18 @@ class Schedule(msgspec.Struct):
             "pipeline parallelism."
         ),
     ] = None
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    swa_max_total_tokens: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Fixed SWA layer KV token capacity (overrides swa_full_tokens_ratio). "
+                "The SWA pool is sized to exactly this many tokens regardless of the "
+                "full pool size, and the freed memory is available to the full pool / "
+                "working memory. The sliding-window architecture only needs "
+                "~per-request window + decode + chunk headroom, so a small fixed cap "
+                "(e.g. 20-40K) is enough and frees GPU memory for larger contexts."
+            ),
+            resolvable=True,
+        ),
+    ] = None

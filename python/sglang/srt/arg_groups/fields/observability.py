@@ -246,3 +246,11 @@ class Observability(msgspec.Struct):
         Optional[str],
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
     ] = None
+    # Class-level DI for the five *MetricsCollector classes. Maps collector role
+    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
+    # to a subclass of the matching base collector. The five instantiation sites
+    # read from this map and fall back to the base class. Class-object only (no
+    # CLI surface) since this exists for embedded use cases that pass a Python
+    # class directly. Default None preserves existing behavior.
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    stat_loggers: A[Optional[Dict[str, type]]] = None

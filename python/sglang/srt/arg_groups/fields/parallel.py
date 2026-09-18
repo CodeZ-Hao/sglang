@@ -279,6 +279,13 @@ class Parallel(msgspec.Struct):
         Optional[int],
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = (
+        False
+    )
+    dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
+    enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
+    prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
 
     # ---- derived: the quotients of the leaves above -------------------------
     #

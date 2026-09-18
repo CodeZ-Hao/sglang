@@ -81,3 +81,5 @@ class Device(msgspec.Struct):
         Optional[List[int]],
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
     ] = None
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    custom_sigquit_handler: A[Optional[Callable]] = None

@@ -458,6 +458,15 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via fold-every-commit instead of per-draft full-state snapshots -- the
+    # verify stores each draft step's raw inputs into a per-slot window and the
+    # commit replays the accepted prefix into the fp32 checkpoint. GDN only;
+    # linear-chain (topk <= 1) only.
+    enable_gdn_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window sized to the draft maximum replaces the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+    ] = False
 
 
 class ExecGraph(msgspec.Struct):
@@ -566,6 +575,11 @@ class ExecGraph(msgspec.Struct):
         int,
         "Set the maximum batch size when using torch compile.",
     ] = 32
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    torchao_config: A[
+        str,
+        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
+    ] = ""
 
 
 class ExecComm(msgspec.Struct):
@@ -848,6 +862,65 @@ class ExecMoe(msgspec.Struct):
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+    ] = None
+    enable_expert_distribution_metrics: A[
+        bool, "Enable logging metrics for expert balancedness"
+    ] = False
+    kt_numa_nodes: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Explicit NUMA node ids for KT thread pools. Defaults to sequential nodes.",
+    ] = None
+    kt_gpu_experts_ratio: A[
+        Optional[float],
+        "[ktransformers parameter] Fraction of all routed-expert weights retained on GPU. Overrides --kt-num-gpu-experts.",
+    ] = None
+    kt_expert_placement_strategy: A[
+        str,
+        "[ktransformers parameter] GPU expert placement: uniform, front-loading, random, or frequency. Frequency placement uses --kt-expert-frequency-file and keeps --init-expert-location trivial.",
+    ] = "uniform"
+    kt_expert_frequency_file: A[
+        Optional[str],
+        "[ktransformers parameter] ExpertDistributionRecorder .pt file containing logical_count values for frequency-based static GPU placement. This does not enable EPLB or remap expert ids.",
+    ] = None
+    kt_mxfp4_backend: A[
+        str,
+        "[ktransformers parameter] Native MXFP4 CPU backend: amx, auto, or avx2. 'amx' requires AMX-TILE and AMX-BF16.",
+    ] = "auto"
+    kt_mxfp4_amx_min_tokens_per_expert: A[
+        int,
+        "[ktransformers parameter] Per-expert token crossover for native AMX-BF16 tiles; smaller batches use AVX512-BF16. Set 0 to force AMX.",
+    ] = 4
+    kt_gpu_prefill_token_threshold: A[
+        int,
+        "[ktransformers parameter] Use a full-GPU layerwise native-MXFP4 Marlin path when a prefill MoE batch reaches this token count. 0 disables it.",
+    ] = 0
+    kt_mxfp4_prefill_slots: A[
+        str,
+        "[ktransformers parameter] Prepared layer slots for MXFP4 prefill: auto, 1, or 2. Auto falls back to one slot when VRAM is limited.",
+    ] = "auto"
+    kt_mxfp4_prefill_host_staging_experts: A[
+        int,
+        "[ktransformers parameter] Number of pinned one-expert host staging buffers used to overlap kt-kernel packing with layerwise GPU prefill.",
+    ] = 8
+    kt_mxfp4_prefill_raw_layers: A[
+        int,
+        "[ktransformers parameter] VRAM budget for the layerwise GPU-MoE cache: keep N layers' raw MXFP4 weights resident (~3.3GiB each) and prefetch the next layers on a background thread while the GPU computes the current layer. Higher N hides more of the KT-writer submit+H2D behind compute at the cost of context/KV headroom; N=0 = serial (no extra VRAM); OOM falls back to N=0. NOTE: N>=2 overlap is FALSIFIED on SM89 (measured: H2D and SM compute CONTEND - concurrent 321ms vs serial 174ms), so the prefetch gives no speedup on this class of GPU; re-validate on other hardware with a smaller model before use.",
+    ] = 0
+    record_kt_gpu_expert_distribution: A[
+        bool,
+        "[ktransformers parameter] Record GPU expert distribution statistics for the KT EP wrapper (consumed by EPLB/metrics).",
+    ] = False
+    kt_enable_dynamic_expert_update: A[
+        bool,
+        "[ktransformers parameter] Dynamically update the GPU-resident experts per batch based on current routing (KT EP wrapper).",
+    ] = False
+    kt_lora_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to KT expert LoRA weights (base adapter).",
+    ] = None
+    kt_expert_lora_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to KT expert-only LoRA weights. Falls back to --kt-lora-path when unset.",
     ] = None
 
 

@@ -262,3 +262,11 @@ class Spec(msgspec.Struct):
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    # --- local (kt fork) fields preserved across the V4.1 port ---
+    speculative_draft_device: A[
+        Optional[str],
+        "Optional CUDA device for the DSpark draft model. Accepts a logical CUDA "
+        "index (for example '2'), 'cuda:2', or a CUDA GPU UUID. The target model "
+        "stays on its normal device. This heterogeneous-GPU path currently "
+        "requires tp_size=dp_size=pp_size=1.",
+    ] = None
