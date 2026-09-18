@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import threading
 from typing import Optional, Union
 
 import msgspec
@@ -23,7 +21,6 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -43,6 +40,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     round_up_grid,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
@@ -78,30 +76,26 @@ class DSparkVerifyPlanner:
         model_runner,
         device,
         tp_rank: int,
-        server_args: ServerArgs,
         verify_num_draft_tokens: int,
-        confidence_device=None,
+        tp_sync: SpecTpSync,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
-        self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
-        self.confidence_device = confidence_device or device
+        self._tp_sync = tp_sync
         self._align_verify_tokens_to_graph_tier = (
-            server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+            get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
-        sts_path = server_args.speculative_dspark_confidence_sts_path
+        sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
-                calibration.temperatures,
-                dtype=torch.float32,
-                device=self.confidence_device,
+                calibration.temperatures, dtype=torch.float32, device=device
             )
             if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get() and not bool(
                 torch.all(sts_temperatures == 1.0)
@@ -153,9 +147,7 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-            self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
-                server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
             )
             self._is_verify_all = (
@@ -179,11 +171,11 @@ class DSparkVerifyPlanner:
                 and is_dp_attention_enabled()
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
-                and require_mlp_tp_gather(self.server_args)
+                and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
-                and self.server_args.pp_size == 1
+                and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
             if tp_rank == 0:
@@ -213,16 +205,6 @@ class DSparkVerifyPlanner:
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
-
-    def _require_prep_in_cuda_graph(self) -> None:
-        if not envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            raise ValueError(
-                f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                f"requires SGLANG_PREP_IN_CUDA_GRAPH=1 (the captured-graph prepare "
-                f"path). It is currently disabled, which would put per-step "
-                f"verify_lens_cpu host reads on the critical path. Set "
-                f"SGLANG_PREP_IN_CUDA_GRAPH=1 or run SGLANG_RAGGED_VERIFY_MODE=static."
-            )
 
     @property
     def carries_confidence(self) -> bool:
@@ -278,9 +260,9 @@ class DSparkVerifyPlanner:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
-            assert (
-                confidence_tap is not None
-            ), "dsv4 compute_confidence needs the compute_base_logits tap"
+            assert confidence_tap is not None, (
+                "dsv4 compute_confidence needs the compute_base_logits tap"
+            )
             with torch.inference_mode():
                 return compute_confidence_hook(
                     anchor_tokens=anchor_tokens,
@@ -389,11 +371,15 @@ class DSparkVerifyPlanner:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
-        return self.compute_budget_sync(
+
+        # No collective: the budget derives only from the broadcast draft tokens
+        # (via confidence), replicated req_generation, and the static sps table.
+        draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
         )
+        return draft_input.verify_token_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
@@ -595,6 +581,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -613,12 +600,6 @@ class DSparkVerifyPlanner:
                 sort_survival=compute_sort_survival(confidence),
                 verify_lens=verify_lens,
             )
-
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
-            broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
 
@@ -770,12 +751,6 @@ def uniform_ragged_layout(
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
     )
-
-
-def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
-    if is_dp_attention_enabled():
-        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
-    return get_tp_group(), tp_size
 
 
 def verify_layout_grid(
@@ -1026,7 +1001,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,
@@ -1039,68 +1013,15 @@ class HostConfidenceBudgetPlanner:
         self.sps_table = sps_table
         self.cfg = cfg
         self._model_runner = model_runner
+        self.forced_budget_frac: Optional[float] = None
+        self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
         )
         self.carry_steps = max(self.lag_steps - int(relay_lag_steps), 0)
-        # PD-parallel runs decode (background thread) concurrently with prefill
-        # (scheduler thread); both threads call into this planner. The carry
-        # ring and last decision are per-thread step state -- sharing them
-        # across threads corrupts the confidence lag and collapses accept.
-        # forced_budget_frac is set once via the admin API and read by all
-        # threads, so it stays a shared attribute.
-        self.forced_budget_frac: Optional[float] = None
-        _env_frac = os.environ.get("SGLANG_DSPARK_FORCE_BUDGET_FRAC", "")
-        if _env_frac:
-            self.forced_budget_frac = float(_env_frac)
-        self._thread_local = threading.local()
-
-    # ------------------------------------------------------------------
-    # per-thread mutable step state
-    # ------------------------------------------------------------------
-    @property
-    def last_decision(self) -> Optional[VerifyBudgetDecision]:
-        return getattr(self._thread_local, "last_decision", None)
-
-    @last_decision.setter
-    def last_decision(self, value: Optional[VerifyBudgetDecision]) -> None:
-        self._thread_local.last_decision = value
-
-    @property
-    def _carry_confidence(self) -> Optional[torch.Tensor]:
-        return getattr(self._thread_local, "carry_confidence", None)
-
-    @_carry_confidence.setter
-    def _carry_confidence(self, value: Optional[torch.Tensor]) -> None:
-        self._thread_local.carry_confidence = value
-
-    @property
-    def _carry_generation(self) -> Optional[torch.Tensor]:
-        return getattr(self._thread_local, "carry_generation", None)
-
-    @_carry_generation.setter
-    def _carry_generation(self, value: Optional[torch.Tensor]) -> None:
-        self._thread_local.carry_generation = value
-
-    @property
-    def _carry_pos(self) -> int:
-        return getattr(self._thread_local, "carry_pos", 0)
-
-    @_carry_pos.setter
-    def _carry_pos(self, value: int) -> None:
-        self._thread_local.carry_pos = value
-
-    def _ensure_carry(self, *, gamma: int) -> None:
-        if getattr(self._thread_local, "carry_confidence", None) is not None:
-            return
-        req_pool_size = int(self._model_runner.req_to_token_pool.req_to_token.shape[0])
-        self._thread_local.carry_confidence = torch.zeros(
-            (self.carry_steps, req_pool_size, gamma), dtype=torch.float32
-        )
-        self._thread_local.carry_generation = torch.zeros(
-            (self.carry_steps, req_pool_size),
-            dtype=torch.int64,
-        )
+        self._carry_confidence: Optional[torch.Tensor] = None
+        self._carry_generation: Optional[torch.Tensor] = None
+        self._carry_pos = 0
 
     def compute_budget(
         self,
@@ -1175,17 +1096,28 @@ class HostConfidenceBudgetPlanner:
         ).view(-1, 1)
         return torch.where(fresh, k_survival, torch.ones_like(k_survival))
 
+    def _ensure_carry(self, *, gamma: int) -> None:
+        if self._carry_confidence is not None:
+            return
+        req_pool_size = int(self._model_runner.req_to_token_pool.req_to_token.shape[0])
+        self._carry_confidence = torch.zeros(
+            (self.carry_steps, req_pool_size, gamma), dtype=torch.float32
+        )
+        self._carry_generation = torch.zeros(
+            (self.carry_steps, req_pool_size),
+            dtype=torch.int64,
+        )
+
 
 def build_sps_cost_table(
     *,
-    server_args: ServerArgs,
     verify_num_draft_tokens: int,
 ) -> Union[SpsCostTable, SpsAdditiveCostTable]:
-    sps_table_path = server_args.speculative_dspark_sps_table_path
+    sps_table_path = get_spec().speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(
         1,
-        int(server_args.max_running_requests or 1) * verify_num_draft_tokens,
+        int(get_schedule().max_running_requests or 1) * verify_num_draft_tokens,
     )
     return build_uninitialized_sps_table(max_batch_tokens=max_batch_tokens)

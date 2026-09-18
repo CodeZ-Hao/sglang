@@ -31,6 +31,8 @@
       std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
       "only float16 and bfloat16 is supported");
 
+namespace sglang {
+
 namespace device::marlin_moe {
 using namespace device::marlin;
 
@@ -1239,12 +1241,9 @@ __global__ void Marlin(
     }
 
     // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
-    // dequant.h provides both the FP16 (half2) and BF16 (nv_bfloat162)
-    // FE8M0/E4M3 specializations, so the call is unconditional: skipping it
-    // (as was done for half2+FE8M0) leaves raw ue8m0 bytes in frag_s and
-    // produces a completely wrong scale (observed as ~20x output blowup and
-    // NaN on the SM89 GPU-expert Marlin path).
-    if constexpr (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) {
+    if constexpr (
+        (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
+        !(std::is_same<scalar_t2, half2>::value && s_type == host::kFE8M0fnu)) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
@@ -1909,3 +1908,5 @@ __global__ void Marlin(
 }  // namespace device::marlin_moe
 
 #endif
+
+}  // namespace sglang

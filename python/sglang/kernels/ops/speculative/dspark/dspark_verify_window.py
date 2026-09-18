@@ -9,6 +9,11 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import (
+    is_npu,
+)
+
+_is_npu = is_npu()
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
@@ -385,9 +390,9 @@ def compact_row_index_triton(
     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
     bs = verify_lens.shape[0]
     # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
-    assert bs <= 1 << (
-        _SEARCH_NBITS - 1
-    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    assert bs <= 1 << (_SEARCH_NBITS - 1), (
+        f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    )
     incl = torch.cumsum(verify_lens, dim=0).contiguous()
     req = torch.empty(padded_total, dtype=torch.int64, device=device)
     within = torch.empty(padded_total, dtype=torch.int64, device=device)
@@ -604,15 +609,43 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
+def build_unified_commit_inject_layout(
+    *,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_pos_offsets: torch.Tensor,
+    commit_lens: torch.Tensor,
+    stride: int,
+    ring_stride: int,
+) -> CommitInjectLayoutResult:
+    """unified_kv counterpart of build_commit_inject_layout.
+
+    Non-unified injection translates the verify tokens' full cache locs through
+    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
+    directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
+    ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
+    are skipped by the scatter. All ops are static-shape (CUDA-graph safe).
+    """
+    bs = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
+    positions = positions_2d.reshape(-1).to(torch.int64)
+    state_slot = (
+        req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
+    )
+    loc = state_slot * ring_stride + positions % ring_stride
+    col = torch.arange(stride, device=device).view(1, -1)
+    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+    swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
+    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+
+
 class BuildCommitInjectLayout:
     @classmethod
     def execute(cls, *args, **kwargs) -> CommitInjectLayoutResult:
-        # Strip ring-pool params from the non-ring triton path.
-        ring_keys = ("swa_ring", "ring_size", "ring_base")
-        ring_kwargs = {k: kwargs.pop(k) for k in ring_keys if k in kwargs}
-        if ring_kwargs.get("swa_ring") or not inputs_on_cuda(*args, **kwargs):
-            return cls.torch(*args, **ring_kwargs, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(
@@ -625,9 +658,6 @@ class BuildCommitInjectLayout:
         full_to_swa_mapping: torch.Tensor,
         commit_lens: torch.Tensor,
         stride: int,
-        swa_ring: bool = False,
-        ring_size: int = 0,
-        ring_base: int = 0,
     ) -> CommitInjectLayoutResult:
         return build_commit_inject_layout(
             req_pool_indices=req_pool_indices,
@@ -637,9 +667,6 @@ class BuildCommitInjectLayout:
             full_to_swa_mapping=full_to_swa_mapping,
             commit_lens=commit_lens,
             stride=stride,
-            swa_ring=swa_ring,
-            ring_size=ring_size,
-            ring_base=ring_base,
         )
 
     @classmethod
@@ -653,9 +680,6 @@ class BuildCommitInjectLayout:
         full_to_swa_mapping: torch.Tensor,
         commit_lens: torch.Tensor,
         stride: int,
-        swa_ring: bool = False,
-        ring_size: int = 0,
-        ring_base: int = 0,
     ) -> CommitInjectLayoutResult:
         return build_commit_inject_layout_triton(
             req_pool_indices=req_pool_indices,
@@ -665,9 +689,6 @@ class BuildCommitInjectLayout:
             full_to_swa_mapping=full_to_swa_mapping,
             commit_lens=commit_lens,
             stride=stride,
-            swa_ring=swa_ring,
-            ring_size=ring_size,
-            ring_base=ring_base,
         )
 
 
@@ -680,9 +701,6 @@ def build_commit_inject_layout(
     full_to_swa_mapping: torch.Tensor,
     commit_lens: torch.Tensor,
     stride: int,
-    swa_ring: bool = False,
-    ring_size: int = 0,
-    ring_base: int = 0,
 ) -> CommitInjectLayoutResult:
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_func,
@@ -694,36 +712,19 @@ def build_commit_inject_layout(
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
 
-    if swa_ring:
-        # CUDA ring pool: committed draft KV goes into the per-request ring.
-        req_slots = req_pool_indices.to(torch.int64).unsqueeze(1).expand(-1, stride)
-        swa_loc = (
-            req_slots.reshape(-1) * ring_size + positions % ring_size + ring_base
-        ).to(torch.int32)
-    else:
-        cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=req_pool_indices,
-            req_to_token=req_to_token,
-            start_offset=prefix_lens,
-            end_offset=prefix_lens + stride,
-            batch_size=bs,
-            draft_token_num=stride,
-            device=device,
-        ).to(dtype=torch.int64)
-        swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
+    cache_loc = assign_extend_cache_locs_func(
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        start_offset=prefix_lens,
+        end_offset=prefix_lens + stride,
+        batch_size=bs,
+        draft_token_num=stride,
+        device=device,
+    ).to(dtype=torch.int64)
+    swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
 
     col = torch.arange(stride, device=device).view(1, -1)
-    if swa_ring:
-        # CUDA ring pool: the draft ring must receive target-derived KV for ALL
-        # verify positions (the draft's window reaches prefix+stride); masking
-        # to commit_lens leaves the speculative slots holding the draft's own
-        # store -> feedback divergence (ring-mode accept ~0). Only the inject
-        # gate (commit_lens == 0 when not armed) is honored.
-        committed = (commit_lens.to(torch.long).view(-1, 1) > 0).expand(
-            -1, stride
-        ).reshape(-1)
-    else:
-        committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
     swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
 
     return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
@@ -773,18 +774,7 @@ def build_commit_inject_layout_triton(
     full_to_swa_mapping: torch.Tensor,
     commit_lens: torch.Tensor,
     stride: int,
-    swa_ring: bool = False,
-    ring_size: int = 0,
-    ring_base: int = 0,
 ) -> CommitInjectLayoutResult:
-    # BuildCommitInjectLayout.execute routes the ring path to the torch kernel;
-    # the triton kernel is only reached with swa_ring=False. The params exist
-    # for signature parity with build_commit_inject_layout (the call site in
-    # BuildCommitInjectLayout.triton always forwards them).
-    assert not swa_ring, (
-        "build_commit_inject_layout_triton does not implement the SWA ring "
-        "pool; ring layouts must route to build_commit_inject_layout (torch)."
-    )
     bs = req_pool_indices.shape[0]
     n = bs * stride
     device = req_pool_indices.device
@@ -812,7 +802,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

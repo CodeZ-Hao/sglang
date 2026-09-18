@@ -13,7 +13,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     break_graph,
-    debug_break_graph,
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: F401

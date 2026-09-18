@@ -1,22 +1,30 @@
-from dataclasses import dataclass
-from itertools import accumulate
-from typing import Callable, List
+"""Import-only shims for deprecated platform backends awaiting CP refactoring.
 
-import torch
-import torch.nn.functional as F
+The legacy CP algorithms have been removed. These names keep the retained
+NPU/MUSA attention backends importable for non-CP inference; calling them fails.
+"""
+from dataclasses import dataclass, field
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import (
-    attn_cp_all_gather_into_tensor,
-    is_allocation_symmetric,
-)
-from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel, get_server_args
 
+def _deprecated_platform_cp():
+    raise ValueError(
+        "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+    )
+
+
+def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
+    _deprecated_platform_cp()
+
+
+def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream):
+    _deprecated_platform_cp()
+
+
+def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
+    _deprecated_platform_cp()
+
+
+# --- local (kt fork) helpers ---
 
 @dataclass
 class ContextParallelMetadata:
@@ -282,147 +290,6 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     )
 
     return outputs
-
-
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
-    """
-    # for in-seq-split
-    |   +-----------before allgather------------+|
-    |   | dp_atten_tp0: block0, block7 |
-    |   | dp_atten_tp1: block1, block6 |
-    |   | dp_atten_tp2: block2, block5 |
-    |   | dp_atten_tp3: block3, block4 |
-    |
-    |   +----------before rerange---------------+|
-    | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
-    |
-    |   +--------------result-------------------+
-    | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
-    |   +-------------------------+
-
-    # for round-robin-split
-    |   +-----------before allgather------------+|
-    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
-    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
-    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
-    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
-    |
-    |   +--------------result-------------------+
-    | token0, token1, token2, token3, token4, token5, token6, token7, ...
-    |   +-------------------------+
-    """
-    from sglang.srt.layers.attention.dsa.utils import (
-        is_dsa_prefill_cp_round_robin_split,
-    )
-
-    if is_dsa_prefill_cp_round_robin_split():
-        with use_symmetric_memory(
-            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-        ):
-            output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
-            )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
-        out_shape = output_tensor.shape
-        output_tensor = (
-            output_tensor.view(cp_size, -1, *out_shape[1:])
-            .transpose(0, 1)
-            .reshape(out_shape)
-        )
-        return output_tensor
-
-    # TODO: Do we need to remove the padding here?
-    bs_seq_len, hidden_size = input_tensor.shape
-    output_tensor = cp_all_gather_reorganized_into_tensor(
-        input_tensor,
-        cp_size,
-        forward_batch,
-        stream,
-    )
-    outputs_list = list(
-        torch.split(
-            output_tensor, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-    )
-    output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
-        dim=0,
-    )
-    output_tensor = output_tensor.view(-1, hidden_size)
-    return output_tensor
-
-
-def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream):
-    """
-    Allgather and reorganize KV cache from all ranks in context parallel group.
-
-    # for in-seq-split
-    |   +-----------before allgather------------+|
-    |   | dp_atten_tp0: block0, block7 |
-    |   | dp_atten_tp1: block1, block6 |
-    |   | dp_atten_tp2: block2, block5 |
-    |   | dp_atten_tp3: block3, block4 |
-    |
-    |   +----------before rerange---------------+|
-    | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
-    |
-    |   +--------------result-------------------+
-    | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
-    |   +-------------------------+
-    """
-    output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
-        input_tensor,
-        cp_size,
-        forward_batch,
-        stream,
-    )
-    outputs_list = list(
-        torch.split(
-            output_tensor, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-    )
-    output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
-        dim=0,
-    )
-    # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
-    return output_tensor
-
-
-def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
-    """
-    Allgather KV cache from all CP ranks and write the full result
-    into each rank's local memory pool.
-
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools.
-    """
-    cache_loc = (
-        forward_batch.out_cache_loc
-        if not layer.is_cross_attention
-        else forward_batch.encoder_out_cache_loc
-    )
-
-    k = k.contiguous()
-    v = v.contiguous()
-
-    key_cache_full = cp_all_gather_rerange_kv_cache(
-        k, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-    value_cache_full = cp_all_gather_rerange_kv_cache(
-        v, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-
-    get_token_to_kv_pool().set_kv_buffer(
-        layer,
-        KVWriteLoc(cache_loc, swa_loc),
-        key_cache_full,
-        value_cache_full,
-        layer.k_scale,
-        layer.v_scale,
-    )
 
 
 def cp_attn_forward_extend(

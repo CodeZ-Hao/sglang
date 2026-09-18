@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 import msgspec
 import torch
@@ -64,18 +63,9 @@ class ComputeDsparkWindowGather:
 class BuildDsparkSwaPageIndices:
     @classmethod
     def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Strip ring-pool params from the non-ring triton path.
-        ring_keys = (
-            "swa_ring",
-            "ring_size",
-            "ring_base",
-            "prefix_lens",
-            "full_to_ring",
-        )
-        ring_kwargs = {k: kwargs.pop(k) for k in ring_keys if k in kwargs}
-        if ring_kwargs.get("swa_ring") or not inputs_on_cuda(*args, **kwargs):
-            return cls.torch(*args, **ring_kwargs, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(
@@ -91,11 +81,6 @@ class BuildDsparkSwaPageIndices:
         block_size: int,
         swa_window: int,
         page_index_aligned_size: int,
-        swa_ring: bool = False,
-        ring_size: int = 0,
-        ring_base: int = 0,
-        prefix_lens: Optional[torch.Tensor] = None,
-        full_to_ring: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return build_dspark_swa_page_indices(
             req_to_token=req_to_token,
@@ -108,11 +93,6 @@ class BuildDsparkSwaPageIndices:
             block_size=block_size,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
-            swa_ring=swa_ring,
-            ring_size=ring_size,
-            ring_base=ring_base,
-            prefix_lens=prefix_lens,
-            full_to_ring=full_to_ring,
         )
 
     @classmethod
@@ -260,11 +240,6 @@ def build_dspark_swa_page_indices(
     block_size: int,
     swa_window: int,
     page_index_aligned_size: int,
-    swa_ring: bool = False,
-    ring_size: int = 0,
-    ring_base: int = 0,
-    prefix_lens: Optional[torch.Tensor] = None,
-    full_to_ring: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if offsets.ndim != 2 or offsets.shape[1] != swa_window:
         raise ValueError(
@@ -275,40 +250,15 @@ def build_dspark_swa_page_indices(
     device = offsets.device
     context_lens = context_lens.to(device=device, dtype=torch.int32)
 
-    if swa_ring:
-        # CUDA ring pool: ring slot = ring_base + req_slot*ring + pos%ring,
-        # computed arithmetically from the LIVE positions (offsets / block_pos)
-        # and req slots. The per-pool full->ring table is only refilled for the
-        # current step's tokens, so table-based window reads of historical
-        # positions resolve to stale/zero slots; arithmetic reads are immune.
-        req_slots = req_pool_indices_per_request[:, None].to(torch.int64)
-        off_safe = offsets.to(torch.int64)
-        window_swa_locs = (
-            ring_base + req_slots * ring_size + off_safe % ring_size
-        ).to(torch.int32)
-        window_swa_locs = window_swa_locs.masked_fill(invalid, -1)
+    window_full_locs = req_to_token[
+        req_pool_indices_per_request[:, None].to(torch.int64), offsets
+    ]
+    window_full_locs = window_full_locs.masked_fill(invalid, 0)
+    window_swa_locs = full_to_swa_mapping[window_full_locs].to(torch.int32)
+    window_swa_locs = window_swa_locs.masked_fill(invalid, -1)
 
-        bcol = torch.arange(
-            block_size, dtype=torch.int64, device=device
-        ).unsqueeze(0)
-        # Drafted tokens sit at positions [prefix_lens, prefix_lens+block_size)
-        # (build_block_pos_offsets == arange(block_size)); the block part of the
-        # ring indices must use those absolute positions.
-        block_pos = prefix_lens.to(torch.int64).unsqueeze(1) + bcol
-        block_swa_locs = (
-            ring_base + req_slots * ring_size + block_pos % ring_size
-        ).to(torch.int32)
-    else:
-        window_full_locs = req_to_token[
-            req_pool_indices_per_request[:, None].to(torch.int64), offsets
-        ]
-        window_full_locs = window_full_locs.masked_fill(invalid, 0)
-        window_swa_locs = full_to_swa_mapping[window_full_locs].to(torch.int32)
-        window_swa_locs = window_swa_locs.masked_fill(invalid, -1)
-
-        block_full_locs = out_loc[: bs * block_size].view(bs, block_size)
-        block_swa_locs = full_to_swa_mapping[block_full_locs].to(torch.int32)
-
+    block_full_locs = out_loc[: bs * block_size].view(bs, block_size)
+    block_swa_locs = full_to_swa_mapping[block_full_locs].to(torch.int32)
 
     target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
 

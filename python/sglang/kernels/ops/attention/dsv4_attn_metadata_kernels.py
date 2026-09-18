@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Optional
 
-import os
 import msgspec
 import torch
 import triton
@@ -143,10 +142,11 @@ def expand_prefill_causally(
         seq_lens_casual = torch.nn.functional.pad(
             seq_lens_casual, (0, pad_size), value=1
         )
-        req_pool_indices_repeated = torch.nn.functional.pad(
-            req_pool_indices_repeated,
-            (0, pad_size),
-            value=req_pool_indices_repeated[-1].item(),
+        req_pool_indices_repeated = torch.cat(
+            (
+                req_pool_indices_repeated,
+                req_pool_indices_repeated[-1:].expand(pad_size),
+            )
         )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
@@ -386,12 +386,9 @@ def build_page_table_positions_triton(
 class BuildCausalSwaPageIndices:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        # Strip ring-pool params from the non-ring triton path.
-        ring_keys = ("swa_ring", "ring_size", "ring_base", "chunk_start", "full_to_ring")
-        ring_kwargs = {k: kwargs.pop(k) for k in ring_keys if k in kwargs}
-        if ring_kwargs.get("swa_ring") or not _inputs_on_cuda(*args, **kwargs):
-            return cls.torch(*args, **ring_kwargs, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if _inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(
@@ -403,11 +400,7 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
-        swa_ring: bool = False,
-        ring_size: int = 0,
-        ring_base: int = 0,
-        chunk_start: Optional[torch.Tensor] = None,
-        full_to_ring: Optional[torch.Tensor] = None,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_causal_swa_page_indices(
             req_to_token=req_to_token,
@@ -416,11 +409,7 @@ class BuildCausalSwaPageIndices:
             seq_lens_casual=seq_lens_casual,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
-            swa_ring=swa_ring,
-            ring_size=ring_size,
-            ring_base=ring_base,
-            chunk_start=chunk_start,
-            full_to_ring=full_to_ring,
+            swa_replay_start=swa_replay_start,
         )
 
     @classmethod
@@ -433,6 +422,7 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_causal_swa_page_indices_triton(
             req_to_token=req_to_token,
@@ -441,7 +431,39 @@ class BuildCausalSwaPageIndices:
             seq_lens_casual=seq_lens_casual,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            swa_replay_start=swa_replay_start,
         )
+
+
+def late_layer_tail_layout(
+    *,
+    extend_lens_cpu: list[int],
+    seq_lens_cpu: list[int],
+    tail_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+    """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
+    Returns (token indices into the extend, per-request tail lengths, per-row
+    absolute window floor)."""
+    tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    if len(extend_lens_cpu) == 1:
+        n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
+        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
+    # One H2D copy for the three length vectors; launch count does not grow with bs.
+    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+    extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
+    total = sum(tail_lens_cpu)
+    req = torch.repeat_interleave(
+        torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
+    )
+    offs = (
+        torch.arange(total, device=device)
+        - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
+    )
+    token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
+    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    return token_indices, tail_lens_cpu, floor
 
 
 def build_causal_swa_page_indices(
@@ -452,55 +474,26 @@ def build_causal_swa_page_indices(
     seq_lens_casual: torch.Tensor,
     swa_window: int,
     page_index_aligned_size: int,
-    swa_ring: bool = False,
-    ring_size: int = 0,
-    ring_base: int = 0,
-    chunk_start: Optional[torch.Tensor] = None,
-    full_to_ring: Optional[torch.Tensor] = None,
+    swa_replay_start: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Window slots each query attends to, -1 where empty. swa_replay_start floors
+    each row's window at that absolute position; None is the plain causal window."""
     device = seq_lens_casual.device
     pos_causal = seq_lens_casual - 1
     num_qo_tokens = seq_lens_casual.size(0)
     offsets = pos_causal.unsqueeze(1) - torch.arange(
         swa_window, dtype=torch.int32, device=device
     ).unsqueeze(0)
-    invalid_offset_mask = offsets < 0
-
-    if swa_ring:
-        # CUDA ring pool: ring slot for position p of request req is
-        # ring_base + req_slot*ring + p%ring. Computed arithmetically from the
-        # LIVE position (off_safe) and req slot -- no full->ring table, so the
-        # read is immune to table staleness and draft/target table divergence
-        # (each pool's table is only refilled for the current step's tokens, so
-        # table-based window reads of historical positions hit zeros). Mirrors
-        # the flat scheme's live-read property.
-        off_safe = offsets.clamp(min=0).to(torch.int64)
-        req_slots = req_pool_indices_repeated[:, None].to(torch.int64)
-        ring_locs = (
-            ring_base + req_slots * ring_size + off_safe % ring_size
-        ).to(torch.int32)
-        cs = (
-            chunk_start
-            if chunk_start is not None
-            else (pos_causal + 1).to(torch.int64)
-        )
-        cs = cs.to(torch.int64).unsqueeze(1)
-        row = torch.arange(
-            num_qo_tokens, dtype=torch.int64, device=device
-        ).unsqueeze(1)
-        scratch_locs = (row + off_safe - pos_causal.to(torch.int64).unsqueeze(1)).to(
-            torch.int32
-        )
-        extend_mask = (off_safe >= cs) & ~invalid_offset_mask
-        swa_indices = torch.where(extend_mask, scratch_locs, ring_locs)
-        swa_indices = swa_indices.masked_fill(invalid_offset_mask, -1)
+    if swa_replay_start is None:
+        invalid_offset_mask = offsets < 0
     else:
-        offsets.masked_fill_(invalid_offset_mask, 0)
-        raw_indices = req_to_token[req_pool_indices_repeated[:, None], offsets]
-        assert raw_indices.shape == (num_qo_tokens, swa_window)
-        raw_indices.masked_fill_(invalid_offset_mask, -1)
-        swa_indices = full_to_swa_mapping[raw_indices]
-        swa_indices = swa_indices.to(torch.int32)
+        invalid_offset_mask = offsets < swa_replay_start.to(offsets.dtype).unsqueeze(1)
+    offsets.masked_fill_(invalid_offset_mask, 0)
+    raw_indices = req_to_token[req_pool_indices_repeated[:, None], offsets]
+    assert raw_indices.shape == (num_qo_tokens, swa_window)
+    raw_indices.masked_fill_(invalid_offset_mask, -1)
+    swa_indices = full_to_swa_mapping[raw_indices]
+    swa_indices = swa_indices.to(torch.int32)
 
     padded_width = (
         (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
@@ -518,10 +511,12 @@ def _causal_swa_page_indices_kernel(
     full_to_swa_ptr,
     req_pool_ptr,
     seq_lens_ptr,
+    swa_replay_start_ptr,
     out_ptr,
     rt_stride,
     swa_window,
     padded_width,
+    HAS_SWA_REPLAY_START: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -529,12 +524,16 @@ def _causal_swa_page_indices_kernel(
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
     out_base = out_ptr + row.to(tl.int64) * padded_width
+    if HAS_SWA_REPLAY_START:
+        floor = tl.load(swa_replay_start_ptr + row).to(tl.int64)
+    else:
+        floor = tl.zeros((), dtype=tl.int64)
 
     for k0 in range(0, padded_width, BLOCK_K):
         k = k0 + tl.arange(0, BLOCK_K)
         kmask = k < padded_width
         off = pos - k.to(tl.int64)
-        valid = (k < swa_window) & (off >= 0) & kmask
+        valid = (k < swa_window) & (off >= floor) & kmask
         full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
             tl.int64
         )
@@ -550,6 +549,7 @@ def build_causal_swa_page_indices_triton(
     seq_lens_casual: torch.Tensor,
     swa_window: int,
     page_index_aligned_size: int,
+    swa_replay_start: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_qo_tokens = seq_lens_casual.size(0)
     padded_width = (
@@ -561,15 +561,87 @@ def build_causal_swa_page_indices_triton(
         device=seq_lens_casual.device,
     )
     BLOCK_K = 256
+    has_swa_replay_start = swa_replay_start is not None
     _causal_swa_page_indices_kernel[(num_qo_tokens,)](
         req_to_token,
         full_to_swa_mapping,
         req_pool_indices_repeated,
         seq_lens_casual,
+        # Unused when HAS_SWA_REPLAY_START is False; any valid pointer will do.
+        swa_replay_start if has_swa_replay_start else seq_lens_casual,
         out,
         req_to_token.stride(0),
         swa_window,
         padded_width,
+        HAS_SWA_REPLAY_START=has_swa_replay_start,
         BLOCK_K=BLOCK_K,
     )
     return out
+
+
+@triton.jit
+def _small_page_table(
+    REQ_TO_TOKEN,
+    REQS,
+    LENS,
+    OUT_LENS,
+    POS,
+    PAGES,
+    SWA,
+    STRIDE: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    if tile == 0:
+        length = tl.load(LENS + row).to(tl.int32)
+        tl.store(OUT_LENS + row, length)
+        tl.store(POS + row, length - 1)
+        tl.store(SWA + row, tl.minimum(length, WINDOW))
+    req = tl.load(REQS + row).to(tl.int64)
+    p = tile * BLOCK + tl.arange(0, BLOCK)
+    slot = tl.load(
+        REQ_TO_TOKEN + req * STRIDE + p.to(tl.int64) * PAGE_SIZE,
+        mask=p < NUM_PAGES,
+        other=0,
+    ).to(tl.int32)
+    tl.store(PAGES + row * NUM_PAGES + p, slot // PAGE_SIZE, mask=p < NUM_PAGES)
+
+
+def build_page_table_positions_small(
+    *,
+    req_to_token,
+    req_pool_indices_repeated,
+    seq_lens_casual,
+    max_seq_len,
+    page_size,
+    swa_window,
+):
+    assert page_size > 0 and page_size & (page_size - 1) == 0
+    rows = seq_lens_casual.numel()
+    pages = triton.cdiv(max_seq_len, page_size)
+    kw = dict(device=seq_lens_casual.device, dtype=torch.int32)
+    lengths, positions, swa = [torch.empty(rows, **kw) for _ in range(3)]
+    table = torch.empty((rows, pages), **kw)
+    _small_page_table[(rows, triton.cdiv(pages, 256))](
+        req_to_token,
+        req_pool_indices_repeated,
+        seq_lens_casual,
+        lengths,
+        positions,
+        table,
+        swa,
+        req_to_token.stride(0),
+        pages,
+        page_size,
+        swa_window,
+        256,
+    )
+    return PageTablePositionsResult(
+        seq_lens_casual=lengths,
+        positions_casual=positions,
+        page_table=table,
+        swa_topk_lengths=swa,
+    )

@@ -28,29 +28,12 @@ def cache_once(fn: F) -> F:
     """
     NOTE: `functools.lru_cache` is not compatible with `torch.compile`
     So we manually implement a simple cache_once decorator to replace it.
-
-    JIT kernel module and capability caches are also partitioned by the
-    effective accelerator architecture.  A heterogeneous process may
-    otherwise compile a module on one CUDA device and replay the same cubin on
-    an incompatible device (for example SM120 target + SM89 draft).  Keep
-    ordinary utility and CPU-only object caches at their historical
-    process-wide scope.
     """
     result_map = {}
-    is_arch_specific_kernel_op = fn.__module__.startswith("sglang.kernels.ops.") and (
-        "module" in fn.__name__
-        or fn.__name__.startswith("can_use_")
-        or (fn.__name__.startswith("_is_") and "supported" in fn.__name__)
-    )
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         key = (args, tuple(sorted(kwargs.items())))
-        if is_arch_specific_kernel_op:
-            # Import lazily to avoid common.py <-> arch.py import cycles.
-            from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-
-            key += (get_jit_cuda_arch().target_name,)
         if key not in result_map:
             result_map[key] = fn(*args, **kwargs)
         return result_map[key]

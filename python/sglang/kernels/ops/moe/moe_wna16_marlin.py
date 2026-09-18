@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -67,10 +67,6 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
-    a_tmp_or_none: Optional[torch.Tensor] = None,
-    c_tmp_or_none: Optional[torch.Tensor] = None,
-    empty_tensor_or_none: Optional[torch.Tensor] = None,
-    initialize_output: bool = False,
 ) -> torch.Tensor:
     device = a.device
 
@@ -98,7 +94,7 @@ def moe_wna16_marlin_gemm(
     has_zp = b_zeros_or_none is not None and b_zeros_or_none.numel() > 0
 
     # Determine has_bias
-    has_bias = b_bias_or_none is not None and b_bias_or_none.numel() > 0
+    has_bias = b_bias_or_none is not None
 
     # Derive num_groups and group_size from b_scales
     num_groups = b_scales.size(1)
@@ -114,21 +110,13 @@ def moe_wna16_marlin_gemm(
             group_size = -1
 
     # Allocate a_tmp for act_order column permutation
-    if a_tmp_or_none is not None:
-        a_tmp = a_tmp_or_none
-    elif has_act_order:
+    if has_act_order:
         a_tmp = torch.empty((size_m * top_k, size_k), dtype=a.dtype, device=device)
     else:
-        a_tmp = (
-            empty_tensor_or_none
-            if empty_tensor_or_none is not None
-            else torch.empty(0, dtype=a.dtype, device=device)
-        )
+        a_tmp = torch.empty(0, dtype=a.dtype, device=device)
 
     # Allocate c_tmp for fp32 reduce
-    if c_tmp_or_none is not None:
-        c_tmp = c_tmp_or_none
-    elif use_fp32_reduce and not use_atomic_add:
+    if use_fp32_reduce and not use_atomic_add:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
@@ -142,63 +130,47 @@ def moe_wna16_marlin_gemm(
         c_tmp = torch.empty(0, dtype=torch.float32, device=device)
 
     # Convert Optional tensors to empty tensors
-    def or_cached_empty(t: Optional[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-        if t is not None:
-            return t
-        if empty_tensor_or_none is not None:
-            return empty_tensor_or_none
-        return _or_empty(None, device, dtype)
+    g_idx_t = _or_empty(g_idx_or_none, device, torch.int32)
+    perm_t = _or_empty(perm_or_none, device, torch.int32)
+    b_zeros_t = _or_empty(b_zeros_or_none, device, a.dtype)
+    b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
+    global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    g_idx_t = or_cached_empty(g_idx_or_none, torch.int32)
-    perm_t = or_cached_empty(perm_or_none, torch.int32)
-    b_zeros_t = or_cached_empty(b_zeros_or_none, a.dtype)
-    b_bias_t = or_cached_empty(b_bias_or_none, a.dtype)
-    global_scale_t = or_cached_empty(global_scale_or_none, a.dtype)
-
-    if initialize_output:
-        c.zero_()
-        if c_tmp.numel() > 0:
-            c_tmp.zero_()
-
-    # Make both the architecture-partitioned module lookup and launch follow
-    # the activation tensor, not whichever heterogeneous DSpark GPU happened
-    # to be current previously.
-    with torch.cuda.device(a.device):
-        module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
-        module.moe_wna16_marlin_gemm(
-            a,
-            c,
-            b_q_weight,
-            b_bias_t,
-            b_scales,
-            global_scale_t,
-            b_zeros_t,
-            g_idx_t,
-            perm_t,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            a_tmp,
-            c_tmp,
-            moe_block_size,
-            top_k,
-            mul_topk_weights,
-            is_ep,
-            b_q_type.id,
-            size_m,
-            size_n,
-            size_k,
-            has_act_order,
-            has_bias,
-            is_k_full,
-            has_zp,
-            num_groups,
-            group_size,
-            use_atomic_add,
-            use_fp32_reduce,
-            is_zp_float,
-        )
+    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+    module.moe_wna16_marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_bias_t,
+        b_scales,
+        global_scale_t,
+        b_zeros_t,
+        g_idx_t,
+        perm_t,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        a_tmp,
+        c_tmp,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_type.id,
+        size_m,
+        size_n,
+        size_k,
+        has_act_order,
+        has_bias,
+        is_k_full,
+        has_zp,
+        num_groups,
+        group_size,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
 
     return c

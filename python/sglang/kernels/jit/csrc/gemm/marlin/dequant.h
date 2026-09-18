@@ -65,6 +65,8 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 #include "marlin_dtypes.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
@@ -458,28 +460,6 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162>(int q, nv_bfloat162* fra
 template <typename scalar_t2, host::ScalarTypeId s_type_id>
 __device__ inline void dequant_fp8_scales(int q, scalar_t2* frag_b);
 
-__device__ inline uint16_t ue8m0_to_half_bits(uint32_t x) {
-  const int exp = static_cast<int>(x & 0xff) - 112;
-  if (exp >= 31) {
-    return static_cast<uint16_t>(0x7c00);
-  }
-  if (exp > 0) {
-    return static_cast<uint16_t>(exp << 10);
-  }
-
-  const int subnormal_shift = static_cast<int>(x & 0xff) - 103;
-  if (subnormal_shift >= 0) {
-    return static_cast<uint16_t>(1u << subnormal_shift);
-  }
-  return 0;
-}
-
-__device__ inline half2 pack_ue8m0_half2(uint32_t low, uint32_t high) {
-  const uint32_t packed =
-      static_cast<uint32_t>(ue8m0_to_half_bits(low)) | (static_cast<uint32_t>(ue8m0_to_half_bits(high)) << 16);
-  return *reinterpret_cast<const half2*>(&packed);
-}
-
 template <>
 __device__ inline void dequant_fp8_scales<half2, host::kFE4M3fn.id()>(int q, half2* frag_b) {
   int Out1 = (q & 0xFF00FF00) >> 1;
@@ -509,15 +489,6 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE4M3fn.id()>(int
 }
 
 template <>
-__device__ inline void dequant_fp8_scales<half2, host::kFE8M0fnu.id()>(int q, half2* frag_b) {
-  const uint32_t uq = static_cast<uint32_t>(q);
-
-  // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = pack_ue8m0_half2((uq >> 8) & 0xff, (uq >> 24) & 0xff);
-  frag_b[0] = pack_ue8m0_half2(uq & 0xff, (uq >> 16) & 0xff);
-}
-
-template <>
 __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(int q, nv_bfloat162* frag_b) {
   // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
   // but we assume that such a extreme value would not occur in real models.
@@ -533,3 +504,5 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(in
 #endif
 
 }  // namespace device::marlin
+
+}  // namespace sglang

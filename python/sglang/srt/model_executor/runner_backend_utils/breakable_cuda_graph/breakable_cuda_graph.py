@@ -22,8 +22,8 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
-import logging
 import threading
+import warnings
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -37,9 +37,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_bool_env_var, get_device_module, is_hip, is_xpu
-
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -48,10 +46,7 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
-    "debug_break_graph",
 ]
-
-_debug_graph_breaks = get_bool_env_var("SGLANG_BCG_DEBUG_BREAKS")
 
 
 def _check_cuda_bindings():
@@ -159,27 +154,23 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
-    captured args lets the shared mempool reclaim per-layer intermediates
-    between segments — storage stays alive for each segment CUDAGraph's
-    lifetime via its pool use_count.
+    """Return a weak-ref view for nonempty accelerator tensors; recurse into
+    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
+    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
+    intermediates between segments — storage stays alive for each segment
+    CUDAGraph's lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
     an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
+        if x.numel() == 0 or x.device.type == "cpu":
+            return x
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
-        values = tuple(_weak_ref_if_tensor(e) for e in x)
-        # MoE dispatch/combine records and several model outputs are
-        # NamedTuples. Preserve their field-bearing type so eager replay sees
-        # the same API as capture instead of a plain tuple.
-        if hasattr(type(x), "_fields"):
-            return type(x)(*values)
-        return values
+        return tuple(_weak_ref_if_tensor(e) for e in x)
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
     return x
@@ -202,11 +193,7 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        if isinstance(dst, tuple):
-            if hasattr(type(dst), "_fields"):
-                return type(dst)(*copied)
-            return tuple(copied)
-        return copied
+        return tuple(copied) if isinstance(dst, tuple) else copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -229,22 +216,6 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def _format_break_label(inner: Callable, args: tuple[Any, ...]) -> str:
-    """Return a useful capture/replay label without retaining layer objects."""
-    name = getattr(inner, "__qualname__", getattr(inner, "__name__", repr(inner)))
-    if inner.__name__ == "break_graph" and args and isinstance(args[0], str):
-        return f"checkpoint[{args[0]}]"
-    if not args:
-        return name
-
-    owner = args[0]
-    kt_config = getattr(owner, "kt_config", None)
-    layer_idx = getattr(kt_config, "layer_idx", None)
-    if layer_idx is not None:
-        return f"{name}[layer={layer_idx}]"
-    return name
-
-
 def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     def decorator(inner: Callable):
         if not enable:
@@ -254,8 +225,6 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             capture = _current_capture_var.get()
             if capture is None:
                 return inner(*args, **kwargs)
-
-            logger.debug("Break graph due to function: %s", inner.__name__)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
@@ -293,7 +262,6 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
-            capture.cuda_graph._break_labels.append(_format_break_label(inner, args))
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
@@ -308,79 +276,19 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(
-        self, deduped_cuda_graph=None, debug_name: str | None = None
-    ) -> None:
+    def __init__(self, deduped_cuda_graph=None) -> None:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
-        self._break_labels: list[str] = []
         self._deduped_cuda_graph = deduped_cuda_graph
-        self._debug_name = debug_name or "unnamed"
-        self._debug_replay = get_bool_env_var("SGLANG_BCG_DEBUG_REPLAY")
-
-    def _segment_label(self, index: int) -> str:
-        after = "model entry" if index == 0 else self._break_labels[index - 1]
-        before = (
-            self._break_labels[index]
-            if index < len(self._break_labels)
-            else "model output"
-        )
-        return f"after {after}, before {before}"
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
-                segment_label = self._segment_label(i)
-                if self._debug_replay:
-                    logger.warning(
-                        "BCG replay %s segment %d/%d begin (%s)",
-                        self._debug_name,
-                        i,
-                        len(self._segments) - 1,
-                        segment_label,
-                    )
-                try:
-                    seg.replay()
-                    if self._debug_replay:
-                        # cudaGraphLaunch is one host operation, so launch blocking
-                        # cannot identify an individual graph segment on its own.
-                        # Synchronize at every BCG boundary while debugging to make
-                        # the segment that raised an asynchronous device fault exact.
-                        stream.synchronize()
-                except Exception:
-                    logger.exception(
-                        "BCG replay %s failed in segment %d/%d (%s)",
-                        self._debug_name,
-                        i,
-                        len(self._segments) - 1,
-                        segment_label,
-                    )
-                    raise
+                seg.replay()
                 if i < len(self._break_fns):
-                    break_label = self._break_labels[i]
-                    if self._debug_replay:
-                        logger.warning(
-                            "BCG replay %s break %d/%d begin (%s)",
-                            self._debug_name,
-                            i,
-                            len(self._break_fns) - 1,
-                            break_label,
-                        )
-                    try:
-                        self._break_fns[i]()
-                        if self._debug_replay:
-                            stream.synchronize()
-                    except Exception:
-                        logger.exception(
-                            "BCG replay %s failed in break %d/%d (%s)",
-                            self._debug_name,
-                            i,
-                            len(self._break_fns) - 1,
-                            break_label,
-                        )
-                        raise
+                    self._break_fns[i]()
         finally:
             _current_stream_var.reset(token)
 
@@ -412,9 +320,9 @@ class BreakableCUDAGraphCapture:
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
     ):
-        assert isinstance(
-            cuda_graph, BreakableCUDAGraph
-        ), "cuda_graph must be a BreakableCUDAGraph"
+        assert isinstance(cuda_graph, BreakableCUDAGraph), (
+            "cuda_graph must be a BreakableCUDAGraph"
+        )
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
@@ -489,20 +397,19 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
-        graph.capture_end()
+        # A segment that enqueued no kernels (back-to-back breaks, or a segment
+        # whose ops all ran eagerly) captures an empty graph, which replays as a
+        # no-op. Torch warns about it on every such capture_end; expected here.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
+            graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
 
 
 @eager_on_graph(True)
-def break_graph(label: str | None = None) -> None:
+def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
-    del label
-
-
-def debug_break_graph(label: str) -> None:
-    """Insert a labeled BCG checkpoint when diagnostic breaks are enabled."""
-    if _debug_graph_breaks:
-        break_graph(label)
+    pass
