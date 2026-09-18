@@ -43,6 +43,11 @@ def normalize_deepseek_v41_config(values):
 class DeepseekV41Config(DeepseekV3Config):
     # V3 accepts the V4.1 compression ratios; the native V4 config rejects 1/2.
     model_type = "deepseek_v41"
+    # V4.1 has routed experts in every layer (verified: layers 0..N all carry
+    # `mlp.experts.*` keys, no dense gate/up_proj). transformers' V3 default
+    # of 3 would mark the first three layers dense, which misroutes the KT
+    # expert masks (all-GPU) and blows up GPU memory.
+    first_k_dense_replace = 0
     vision_n_layers = 0
     hc_pre_from_prev_sublayer = True
     q_head_norm = False
