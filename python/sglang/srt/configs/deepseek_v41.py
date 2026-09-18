@@ -68,7 +68,13 @@ class DeepseekV41Config(DeepseekV3Config):
     def __init__(self, **kwargs):
         kwargs = normalize_deepseek_v41_config(kwargs)
         kwargs["model_type"] = "deepseek_v41"
+        # V4.1 carries routed experts in every layer; the checkpoint has no
+        # dense gate/up_proj (verified against model.safetensors.index.json).
+        # transformers' V3Config.__init__ defaults this to 3, which would mark
+        # the first three layers dense and misroute KT expert masks.
+        kwargs.setdefault("first_k_dense_replace", 0)
         super().__init__(**kwargs)
+        self.first_k_dense_replace = kwargs["first_k_dense_replace"]
 
     def to_dict(self):
         values = super().to_dict()
