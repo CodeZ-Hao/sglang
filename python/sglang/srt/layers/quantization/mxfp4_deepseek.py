@@ -15,7 +15,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
@@ -177,7 +177,7 @@ class DeepSeekMxfp4MoEMethod:
         self._fp8 = fp8_method
         self.prefix = prefix
         self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
+            get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -305,9 +305,7 @@ class DeepSeekMxfp4MoEMethod:
             if torch.cuda.is_available()
             else None
         )
-        _prefill_threshold = (
-            getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0) or 0
-        )
+        _prefill_threshold = get_exec().moe.kt_gpu_prefill_token_threshold or 0
         _resident_experts = layer.w13_weight.shape[0]
         _global_experts = getattr(layer, "num_experts", _resident_experts)
         # The resident partial-expert image is shared by hybrid prefill and

@@ -566,7 +566,7 @@ class SharedFullContext:
             from sglang.srt.layers.quantization.mxfp4_deepseek import (
                 DeepSeekMxfp4MoEMethod,
             )
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_exec
             _v4_env = _os_v4.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
             if _v4_env == "1":
                 _do_v4_wrap = True
@@ -574,7 +574,7 @@ class SharedFullContext:
                 _do_v4_wrap = False
             else:
                 _do_v4_wrap = (
-                    (get_global_server_args().kt_method or "").upper() == "MXFP4"
+                    (get_exec().moe.kt_method or "").upper() == "MXFP4"
                 )
             if _do_v4_wrap and isinstance(self.gpu_method, Fp8MoEMethod):
                 self.gpu_method = DeepSeekMxfp4MoEMethod(self.gpu_method, prefix="")
