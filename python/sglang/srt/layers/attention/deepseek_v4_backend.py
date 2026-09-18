@@ -3824,10 +3824,10 @@ class DeepseekV4AttnBackend(
                 # "Unsupported architecture for sparse decode fwd" here.
                 return self._forward_dspark_sm8x_swa(
                     q=q,
-                    quant_k_cache=swa_k_cache_raw,
+                    quant_k_cache=swa_k_cache,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
-                    page_size=token_to_kv.swa_window_size,
+                    page_size=token_to_kv_pool.swa_window_size,
                     attn_sink=attn_sink,
                     extra_k_cache=extra_k_cache,
                     extra_indices=extra_indices,
@@ -3906,6 +3906,23 @@ class DeepseekV4AttnBackend(
                     extra_k_cache,
                     extra_indices,
                     extra_topk_lengths,
+                )
+
+            if torch.cuda.get_device_capability()[0] == 8:
+                # SM8x (kt fork): FlashMLA sparse decode is Hopper-only;
+                # sgl_kernel raises "Unsupported architecture for sparse
+                # decode fwd" on Ada/Ampere. Route through the dequant +
+                # BF16 tensor-core path instead.
+                return self._forward_dspark_sm8x_swa(
+                    q=q,
+                    quant_k_cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    page_size=token_to_kv_pool.swa_window_size,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
                 )
 
             if get_platform().is_sm120:
