@@ -4480,6 +4480,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # graph capture (where host-to-device copies are disallowed).
         self._logical_to_physical_cuda: Optional[torch.Tensor] = None
 
+        # Persistent scalar tensor on GPU used as the "no CPU expert" sentinel
+        # in torch.where during CUDA graph capture (host->device copies of
+        # scalars are disallowed while capturing).
+        self._cpu_sentinel_cuda: Optional[torch.Tensor] = None
+
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
         self._cpu_stream: Optional[torch.cuda.Stream] = None
@@ -4702,6 +4707,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self._logical_to_physical_cuda = logical_to_physical.to(
                 device="cuda", non_blocking=True
             )
+            # Persistent -1 sentinel on GPU for torch.where inside CUDA graph
+            # capture (host->device scalar copies are disallowed while capturing).
+            self._cpu_sentinel_cuda = torch.tensor(
+                -1, dtype=torch.int64, device="cuda"
+            )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
             if self.kt_expert_lora_enabled:
                 if self.kt_expert_lora_weights is None:
@@ -4897,10 +4907,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 0, self.gpu_experts_mask.numel() - 1
             )
             on_gpu = self.gpu_experts_mask_cuda[safe_ids]
+            _sentinel = getattr(self, "_cpu_sentinel_cuda", None)
+            if _sentinel is None or _sentinel.device != topk_ids.device:
+                _sentinel = torch.tensor(-1, dtype=torch.int64, device=topk_ids.device)
             cpu_ids = torch.where(
                 (topk_ids_long >= 0) & ~on_gpu,
                 _ltp[safe_ids],
-                torch.tensor(-1, dtype=torch.int64, device=topk_ids.device),
+                _sentinel,
             )
             topk_ids = cpu_ids
 
