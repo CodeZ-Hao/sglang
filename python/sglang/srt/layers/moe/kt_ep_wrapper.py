@@ -4473,7 +4473,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
         # Logical expert id -> KT physical slot (built in
-        # process_weights_after_loading from the EPLB map).
+        # process_weights_after_loading from the EPLB map). Pinned so it can
+        # be copied to GPU inside a CUDA graph capture.
         self._logical_to_physical_cpu: Optional[torch.Tensor] = None
 
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
@@ -4690,7 +4691,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_physical[physical_to_logical_map_cpu] = torch.arange(
                 layer.num_experts, dtype=torch.int64
             )
-            self._logical_to_physical_cpu = logical_to_physical
+            # Pin so the tensor can be copied to GPU inside CUDA graph capture.
+            self._logical_to_physical_cpu = logical_to_physical.pin_memory()
             self.wrapper.load_weights(physical_to_logical_map_cpu)
             if self.kt_expert_lora_enabled:
                 if self.kt_expert_lora_weights is None:
