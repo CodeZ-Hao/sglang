@@ -4476,6 +4476,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # process_weights_after_loading from the EPLB map). Pinned so it can
         # be copied to GPU inside a CUDA graph capture.
         self._logical_to_physical_cpu: Optional[torch.Tensor] = None
+        # Pre-built GPU copy of the logical->physical map for use inside CUDA
+        # graph capture (where host-to-device copies are disallowed).
+        self._logical_to_physical_cuda: Optional[torch.Tensor] = None
 
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
@@ -4693,6 +4696,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             # Pin so the tensor can be copied to GPU inside CUDA graph capture.
             self._logical_to_physical_cpu = logical_to_physical.pin_memory()
+            # Pre-build a GPU copy for use during CUDA graph capture, where
+            # host-to-device copies are disallowed. The CPU path below will
+            # prefer this when available.
+            self._logical_to_physical_cuda = logical_to_physical.to(
+                device="cuda", non_blocking=True
+            )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
             if self.kt_expert_lora_enabled:
                 if self.kt_expert_lora_weights is None:
@@ -4868,14 +4877,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # remap CPU experts logical -> physical. On the all-CPU (0-expert)
         # path the map is identity so this is a no-op beyond the mask.
         if self.num_gpu_experts > 0 or getattr(self, "_logical_to_physical_cpu", None) is not None:
-            _ltp = getattr(self, "_logical_to_physical_cpu", None)
-            if _ltp is None:
-                _ltp = torch.arange(
-                    self.gpu_experts_mask.numel(),
-                    dtype=torch.int64,
-                    device="cpu",
-                )
-            _ltp = _ltp.to(device=topk_ids.device)
+            # Prefer the pre-built GPU copy during CUDA graph capture (host->device
+            # copies are disallowed while capturing). Fall back to the pinned CPU
+            # copy for normal execution.
+            _ltp_cuda = getattr(self, "_logical_to_physical_cuda", None)
+            if _ltp_cuda is not None and _ltp_cuda.device == topk_ids.device:
+                _ltp = _ltp_cuda
+            else:
+                _ltp = getattr(self, "_logical_to_physical_cpu", None)
+                if _ltp is None:
+                    _ltp = torch.arange(
+                        self.gpu_experts_mask.numel(),
+                        dtype=torch.int64,
+                        device="cpu",
+                    )
+                _ltp = _ltp.to(device=topk_ids.device)
             topk_ids_long = topk_ids.to(torch.int64)
             safe_ids = topk_ids_long.clamp(
                 0, self.gpu_experts_mask.numel() - 1
