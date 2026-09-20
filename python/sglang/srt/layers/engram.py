@@ -546,6 +546,52 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+def _interleave_across_nodes(addr: int, nbytes: int) -> None:
+    """Spread a fresh mapping's pages over every NUMA node.
+
+    The scheduler's main thread carries a node-0 `MPOL_BIND`: kt-kernel's
+    `set_to_numa()` calls `numa_bind()`, which sets both the CPU affinity and
+    the memory policy of the calling thread, and every thread created later
+    inherits it. Without an explicit override a ~96 GiB table therefore lands
+    entirely on node 0 — the node the model's own host weights already fill —
+    and the box OOMs with the other node's memory sitting free. The policy
+    applies to pages faulted *after* the call, so this has to run before
+    anything writes to the mapping.
+    """
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+    except OSError:
+        logger.warning(
+            "engram host table: libnuma unavailable; the table will follow the "
+            "thread's memory policy and may not fit on one node"
+        )
+        return
+    libnuma.numa_num_configured_nodes.restype = ctypes.c_int
+    libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+    libnuma.numa_bitmask_setbit.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    libnuma.numa_interleave_memory.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    )
+    libnuma.numa_bitmask_free.argtypes = (ctypes.c_void_p,)
+
+    nodes = libnuma.numa_num_configured_nodes()
+    if nodes < 2:
+        return
+    mask = libnuma.numa_allocate_nodemask()
+    if not mask:
+        return
+    try:
+        for node in range(nodes):
+            libnuma.numa_bitmask_setbit(ctypes.c_void_p(mask), node)
+        libnuma.numa_interleave_memory(
+            ctypes.c_void_p(addr), ctypes.c_size_t(nbytes), ctypes.c_void_p(mask)
+        )
+    finally:
+        libnuma.numa_bitmask_free(ctypes.c_void_p(mask))
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -582,6 +628,9 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        # Before any page is faulted: the calling thread's node-0 MPOL_BIND would
+        # otherwise put the whole table on one node.
+        _interleave_across_nodes(self.bytes.data_ptr(), nbytes)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.

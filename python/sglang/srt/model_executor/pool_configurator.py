@@ -997,6 +997,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        # A fixed cap pins the SWA pool to exactly this many tokens no matter how
+        # large the full pool grows, so the freed memory goes to the full pool.
+        self.swa_max_total_tokens = get_schedule().swa_max_total_tokens
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
             self.operator_swa_ratio
@@ -1196,6 +1199,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
         budgets from the request cap plus radix headroom, not full_tokens."""
+        if self.swa_max_total_tokens is not None:
+            # An explicit cap outranks both ratio sizing and the computed cap: it
+            # is the operator pinning the pool. Validate it here -- cap mode skips
+            # validate_swa_pool_size, and a cap under the admission floor would
+            # otherwise hang the server at warmup instead of failing.
+            cap = ceil_align(self.swa_max_total_tokens, self.page_size)
+            if (
+                self.sliding_window_size is not None
+                and self.sliding_window_size + self.page_size >= cap
+            ):
+                raise ValueError(
+                    f"SWA fixed cap ({cap} tokens) cannot hold even one request: "
+                    f"the prefill admission floor is sliding_window_size "
+                    f"({self.sliding_window_size}) + page_size ({self.page_size}). "
+                    f"Increase --swa-max-total-tokens."
+                )
+            return cap
         if self.operator_swa_ratio is not None:
             return None
         if self._unified:
@@ -1303,9 +1323,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"swa_full_tokens_ratio={self.swa_ratio}"
             )
         else:
+            source = (
+                "explicit --swa-max-total-tokens"
+                if self.swa_max_total_tokens is not None
+                else "computed request cap"
+            )
             logger.info(
-                f"DSV4 SWA sizing: mode=cap, swa_tokens={swa_tokens}, "
-                f"request_cap+headroom={self.swa_cap_tokens}, "
+                f"DSV4 SWA sizing: mode=cap ({source}), swa_tokens={swa_tokens}, "
                 f"prefix_tails={self.swa_prefix_tails}"
             )
         return _DSV4PoolSizes(

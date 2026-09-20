@@ -695,6 +695,7 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        self.maybe_init_mxfp4_host_cache_build()
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1457,6 +1458,27 @@ class ModelRunner:
             if resolved_kv_cache_dtype is not None
             else get_model().kv_cache_dtype
         )
+
+    def maybe_init_mxfp4_host_cache_build(self):
+        """Start the KT MXFP4 layerwise host-weight cache build in the background.
+
+        Every layer is registered by now, so the daemon packs each layer's CPU
+        experts into host memory during startup.  That matters for two reasons:
+        the cold first layerwise prefill only does H2D instead of paying
+        pack + alloc per layer, and `_maybe_free_full_raw` can release the
+        duplicate full-layer raw image (~7.9 GiB on V4.1) on the first
+        layerwise layer instead of waiting for a lazy per-layer build that the
+        late layers never trigger.
+        """
+        if (self.server_args.kt_method or "").upper() != "MXFP4":
+            return
+        if (self.server_args.kt_gpu_prefill_token_threshold or 0) <= 0:
+            return
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            maybe_start_mxfp4_host_cache_build,
+        )
+
+        maybe_start_mxfp4_host_cache_build()
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         return get_attention_backend(

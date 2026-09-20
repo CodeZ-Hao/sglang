@@ -1110,6 +1110,8 @@ class ChatCompletionRequest(BaseModel):
         Priority: user value > model generation_config > OpenAI defaults
         """
 
+        from sglang.srt.environ import envs
+
         def get_param(param_name: str):
             value = getattr(self, param_name)
             if value is None:
@@ -1142,7 +1144,9 @@ class ChatCompletionRequest(BaseModel):
             "ebnf": self.ebnf,
             "n": self.n,
             "no_stop_trim": self.no_stop_trim,
-            "ignore_eos": self.ignore_eos,
+            "ignore_eos": (
+                True if envs.SGLANG_FORCE_IGNORE_EOS.get() else self.ignore_eos
+            ),
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,

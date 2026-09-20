@@ -660,6 +660,23 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
                     self.hc_head_scale,
                 ) = make_hc_head_params(config.hc_mult, config.hidden_size)
 
+        # Draft/MTP stage MoE weights live under "mtp.{stage_id}" in the
+        # checkpoint (mtp.{stage}.ffn.experts.{e}.{w1,w3,w2}), not under
+        # "model.layers.{N}". Point the KT wrapper at the mtp key. The
+        # attention layer_id stays at 0..2 (the DSV4 KV pool is sized for the
+        # 3 draft stages), so the KT weight key prefix is decoupled from it.
+        moe_qm = getattr(getattr(self.mlp, "experts", None), "quant_method", None)
+        kt_config = getattr(moe_qm, "kt_config", None)
+        if kt_config is not None:
+            mtp_prefix = f"mtp.{self.stage_id}"
+            kt_config.weight_key_prefix = mtp_prefix
+            # The KTMoEWrapper is already constructed inside
+            # create_weights; patch its prefix too so load_weights probes
+            # "mtp.{stage}" instead of "model.layers.{idx}".
+            wrapper = getattr(moe_qm, "wrapper", None)
+            if wrapper is not None:
+                wrapper.weight_key_prefix = mtp_prefix
+
     def _build_self_attn(
         self,
         *,

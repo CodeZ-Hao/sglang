@@ -78,6 +78,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
+        self._use_shared_output_buffer: Optional[bool] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -98,6 +99,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self._use_shared_output_buffer = None
         self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
@@ -129,7 +131,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
-        if self._shared_output_buffer is None:
+        supports_shared_output = self._supports_shared_output(warmup_out)
+        if self._use_shared_output_buffer is None:
+            self._use_shared_output_buffer = supports_shared_output
+        elif self._use_shared_output_buffer != supports_shared_output:
+            raise ValueError(
+                "BCG output structure changed between capture sizes: "
+                f"shared-buffer support changed to {supports_shared_output} "
+                f"for {type(warmup_out)}"
+            )
+
+        if supports_shared_output and self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with (
             graph_pool_capture_scope(),
@@ -142,14 +154,42 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if self._supports_shared_output(out) != supports_shared_output:
+                raise ValueError(
+                    "BCG output structure changed between warmup and capture: "
+                    f"{type(warmup_out)} vs {type(out)}"
+                )
+            if supports_shared_output:
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        if supports_shared_output:
+            stored = self._slice_output(self._shared_output_buffer, out_rows)
+        else:
+            # Structured model outputs (notably LogitsProcessorOutput during
+            # speculative target verification) already own graph-stable tensor
+            # storage. Keep the captured object directly, as FullCudaGraphBackend
+            # does. Sending it through the shared tensor-tree buffer would both
+            # mistake request batch size for verify-token rows and add a large
+            # logits copy to every replay.
+            stored = out
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+
+    @classmethod
+    def _supports_shared_output(cls, output: Any) -> bool:
+        """Whether ``output`` can use the recursive shared tensor-tree buffer."""
+        if (
+            output is None
+            or torch.is_tensor(output)
+            or isinstance(output, PPProxyTensors)
+        ):
+            return True
+        if isinstance(output, (list, tuple)):
+            return all(cls._supports_shared_output(item) for item in output)
+        return False
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
@@ -265,3 +305,4 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+        self._use_shared_output_buffer = None

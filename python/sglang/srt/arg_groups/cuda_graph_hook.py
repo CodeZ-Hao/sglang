@@ -123,6 +123,38 @@ def apply_cuda_graph_compatibility(server_args: Any):
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
 
+    # KT offload runs host AMX work inside every MoE layer, so the decode graph
+    # must be segmented (breakable); a full graph would replay the host-side
+    # dispatch as captured and emit garbage logits. This has to run before the
+    # prefill-locked early return above, since it constrains the decode phase.
+    if cfg.kt_weight_path is not None:
+        decode_locked = (Phase.DECODE, "backend") in server_args._cuda_graph_config_locked
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        if decode_backend == Backend.FULL:
+            if decode_locked:
+                raise ValueError(
+                    "--kt-weight-path is incompatible with a full decode CUDA "
+                    "graph because KT executes host AMX work during each MoE "
+                    "layer. Use --cuda-graph-backend-decode breakable or "
+                    "--disable-decode-cuda-graph."
+                )
+            logger.info(
+                "Using breakable decode CUDA graph for KT CPU/GPU expert offload."
+            )
+            declare_resolution(
+                server_args,
+                "_apply_cuda_graph_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.BREAKABLE
+                ),
+            )
+            cfg = resolving_view(server_args)
+        elif decode_backend not in (Backend.BREAKABLE, Backend.DISABLED):
+            raise ValueError(
+                "--kt-weight-path requires a breakable or disabled decode "
+                f"CUDA graph, got {decode_backend!r}."
+            )
+
     # PP prefill graph replay is opt-in. It is most useful for small
     # aggregate forwards, while enabling it implicitly would also capture
     # large buckets that can be slower than eager. An explicit backend

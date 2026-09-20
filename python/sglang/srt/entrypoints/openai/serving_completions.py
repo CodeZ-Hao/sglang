@@ -145,6 +145,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
+        from sglang.srt.environ import envs
+
         # Start with common parameters
         sampling_params = {
             "temperature": request.temperature,
@@ -164,7 +166,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
-            "ignore_eos": request.ignore_eos,
+            "ignore_eos": (
+                True if envs.SGLANG_FORCE_IGNORE_EOS.get() else request.ignore_eos
+            ),
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,

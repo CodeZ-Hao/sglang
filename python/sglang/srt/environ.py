@@ -518,6 +518,10 @@ class Envs:
     # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
     # every callsite migrates.
     SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
+    # Record the full CUDA allocator history from scheduler startup
+    # (torch.cuda.memory._record_memory_history). Pair with the
+    # /dump_... memory snapshot endpoint when chasing an allocation leak.
+    SGLANG_MEM_HISTORY = EnvBool(False)
 
     # ===================================================================
     # Runtime simulations
@@ -556,6 +560,11 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Fixed SWA token capacity for the DSPARK draft worker, independent of the
+    # target's. 0 (default) keeps the target's size. The draft attends over one
+    # sliding window plus its own draft tokens, so it fits in a smaller pool; too
+    # small degrades accept because the draft's slot allocation spans the batch.
+    SGLANG_DSPARK_DRAFT_SWA_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -574,6 +583,12 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Force the KV pool's physical pages to be committed at startup (the buffers
+    # may otherwise be backed lazily as KV is written), so an OOM surfaces during
+    # loading instead of mid-prefill and admission sees the true physical budget.
+    # The KT Marlin staging is charged eagerly under the same switch. Draft
+    # worker pools are excluded (they are small and spec-only).
+    SGLANG_PRE_COMMIT_MEMORY = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -633,6 +648,21 @@ class Envs:
     # an accurate TTFT for benchmarking; the upstream default of 50 trades
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Release cached device memory before a prefill batch (a chunked prefill's
+    # working memory is the peak on a small GPU running KT expert offload).
+    SGLANG_EMPTY_CACHE_PRE_PREFILL = EnvBool(False)
+    # Release cached device memory after each prefill chunk once the reserved
+    # pool exceeds 30 GB, so a long chunked prefill does not hold the whole
+    # working-memory peak in the allocator cache.
+    SGLANG_EMPTY_CACHE_PER_CHUNK = EnvBool(False)
+    # Max times a request may be retried after a prefill OOM (KV or working
+    # memory insufficient) before it fails with HTTP 500. Without a cap a request
+    # that can never fit would be requeued forever and the client would hang.
+    SGLANG_PREFILL_MAX_OOM_RETRIES = EnvInt(4)
+    # Generate to max_tokens regardless of the request's EOS. Throughput
+    # benchmark methodology: the steady-state decode rate is otherwise
+    # under-measured by short generations.
+    SGLANG_FORCE_IGNORE_EOS = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

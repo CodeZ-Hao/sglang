@@ -142,6 +142,10 @@ SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
+# SM8x eager SWA fallback: chunk queries so the dequantized window workspace
+# stays bounded (a full 256+ token prefill window can reach ~1 GiB).
+_SM8X_ATTN_CHUNK = 512
+
 
 @functools.lru_cache(maxsize=None)
 def _is_sm100_or_newer() -> bool:
@@ -3740,6 +3744,10 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            # The SM8x dequant helper indexes the cache by whole pages, so it
+            # needs the flat (num_pages, bytes_per_page) buffer, not the
+            # per-token view built below.
+            swa_k_cache_raw = swa_k_cache
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio != 0:
@@ -3824,7 +3832,7 @@ class DeepseekV4AttnBackend(
                 # "Unsupported architecture for sparse decode fwd" here.
                 return self._forward_dspark_sm8x_swa(
                     q=q,
-                    quant_k_cache=swa_k_cache,
+                    quant_k_cache=swa_k_cache_raw,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     page_size=token_to_kv_pool.swa_page_size,
@@ -3915,7 +3923,7 @@ class DeepseekV4AttnBackend(
                 # BF16 tensor-core path instead.
                 return self._forward_dspark_sm8x_swa(
                     q=q,
-                    quant_k_cache=swa_k_cache,
+                    quant_k_cache=swa_k_cache_raw,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     page_size=token_to_kv_pool.swa_page_size,
@@ -4848,3 +4856,6 @@ def _sm8x_attn_chunk_fn(
 
     sink = attn_sink.view(-1)
     return fused_sm8x_attn(q, kv, valid, sink, softmax_scale)
+
+
+_sm8x_attn_chunk_compiled = torch.compile(_sm8x_attn_chunk_fn)

@@ -7,9 +7,6 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
-    can_use_write_back_jit_kernel,
-)
-from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
@@ -303,9 +300,19 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
-            element_size=self.item_bytes * self.dtype.itemsize,
-        )
+        # The staged JIT relayout kernel assumes a simple contiguous page
+        # layout (page_size tokens x element_size per page). DeepSeek-V4 pools
+        # use 576-byte-aligned padded pages (bytes_per_page_padded) and
+        # token-granular C4/C128 regions, which the kernel mis-indexes
+        # (segfault in hicache_relayout_kernel on the 10K+ backup). Force the
+        # AOT lf_pf fallback, which was written for this layout.
+        self.can_use_write_back_jit = False
+        # The staging buffer is only used by the staged JIT kernel; DSV4 uses
+        # the AOT fallback, so it is dead weight (~400MB for the swa pool).
+        # Skip it to keep HiCache GPU-memory neutral.
+        if not self.can_use_write_back_jit:
+            self.staging_buffer = None
+            return
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.item_bytes),
@@ -839,9 +846,13 @@ class DeepSeekV4StateHostPool(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
-            element_size=self.state_page_bytes * self.dtype.itemsize,
-        )
+        # DSV4 state pools share the padded-page layout that the staged JIT
+        # relayout kernel mis-indexes; always use the AOT lf_pf fallback and
+        # skip the (unused) staging buffer.
+        self.can_use_write_back_jit = False
+        if not self.can_use_write_back_jit:
+            self.staging_buffer = None
+            return
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.state_page_bytes),

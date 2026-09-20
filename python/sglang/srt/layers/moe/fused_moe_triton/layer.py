@@ -459,7 +459,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method = quant_method
         server_args = get_server_args()
-        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        kt_config = create_kt_config_from_server_args(
+            server_args, layer_id, self.num_local_experts
+        )
         if kt_config is not None:
             if self.quant_method is not None:
                 gpu_method = self.quant_method

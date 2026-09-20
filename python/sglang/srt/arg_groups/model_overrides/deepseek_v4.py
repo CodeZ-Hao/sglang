@@ -43,13 +43,12 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
         logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
 
-    # Left unset, the pool configurator sizes the SWA pool from the request cap.
-    if (
-        cfg.swa_full_tokens_ratio is None
-        and getattr(hf_config, "model_type", None) != "deepseek_v41"
-    ):
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+    # NOTE: swa_full_tokens_ratio is NOT force-overridden for DSV4. The sliding
+    # window is a fixed 128 tokens, so the SWA pool does not need to scale with
+    # the full pool at all. Leaving the field unset keeps the pool configurator
+    # on cap mode (request cap + chunk headroom) or on an explicit
+    # --swa-max-total-tokens, both of which are far smaller than any ratio and
+    # hand the freed device memory to the full pool.
 
     page_size = 256
     if cfg.device == "npu":

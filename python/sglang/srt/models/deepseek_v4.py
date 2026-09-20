@@ -108,6 +108,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
@@ -649,6 +650,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _should_use_breakable_attention(forward_batch: ForwardBatch) -> bool:
+    """Use the eager attention seam only when the prefill runner owns it.
+
+    Decode breakable graphs do not install a TcPiecewiseForwardContext. In
+    particular, speculative TARGET_VERIFY is classified as an extend forward,
+    so checking ``is_extend()`` alone would route decode capture through the
+    prefill-only helper with no live ForwardBatch context.
+    """
+    return (
+        forward_batch.forward_mode.is_extend()
+        and is_in_breakable_cuda_graph()
+        and get_tc_piecewise_forward_context() is not None
+    )
 
 
 @register_custom_op(mutates_args=["output"])
@@ -2012,9 +2028,8 @@ class MQALayer(MqaAttentionBase):
             self.compressor is not None or self.indexer is not None
         ):
             if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                _should_use_breakable_attention(forward_batch)
+                and not attn_backend.low_ratio_prefill_graph
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -2315,7 +2330,7 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if _should_use_breakable_attention(forward_batch):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -3131,6 +3146,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and is_in_breakable_cuda_graph()
+        ):
+            kt_graph_method = getattr(
+                getattr(self.mlp, "experts", None), "quant_method", None
+            )
+            if isinstance(kt_graph_method, KTEPWrapperMethod):
+                # These MHC values are produced before KT's eager graph break and
+                # consumed after it. They are not KT call arguments, so BCG cannot
+                # discover their lifetime automatically. Stable owner-retained
+                # buffers prevent later graph captures from recycling the addresses.
+                residual = kt_graph_method.bridge_cuda_graph_tensor(
+                    "ffn_residual", residual
+                )
+                post = kt_graph_method.bridge_cuda_graph_tensor("ffn_post", post)
+                comb = kt_graph_method.bridge_cuda_graph_tensor("ffn_comb", comb)
 
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
@@ -4110,6 +4143,61 @@ class DeepseekV4Model(nn.Module):
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
 
+        self._verify_v41_feature_map(config)
+
+    def _verify_v41_feature_map(self, config: DeepSeekV4Config) -> None:
+        """Assert every config-declared V4.1 sub-module was actually built.
+
+        The compressor/indexer/engram modules are constructed from the config's
+        layer-id lists. A silent miss (a list read as empty, an off-by-one in
+        the id comparison) still serves coherent text on short prompts while
+        quietly dropping the architecture feature, so check the built set
+        against the declared one and log the map.
+        """
+        if config.model_type != "deepseek_v41":
+            return
+
+        compressors, indexers, engrams = [], [], []
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            if layer.self_attn.compressor is not None:
+                compressors.append(i)
+            if layer.self_attn.indexer is not None:
+                indexers.append(i)
+            if layer.engram is not None:
+                engrams.append(i)
+
+        def local(ids) -> List[int]:
+            return [i for i in ids if self.start_layer <= i < self.end_layer]
+
+        for name, declared, built in (
+            ("compressor", config.kv_source_layer_ids, compressors),
+            ("indexer", config.index_source_layer_ids, indexers),
+            ("engram", config.engram_layer_ids, engrams),
+        ):
+            want = local(declared)
+            if want != built:
+                raise RuntimeError(
+                    f"DeepSeek-V4.1 {name} built on layers {built}, but the "
+                    f"config declares {want}"
+                )
+
+        logger.info(
+            "DeepSeek-V4.1 feature map: layers=%d swa=%s nextn=%s | "
+            "compressor=%s indexer=%s engram=%s | candidate source=%s "
+            "topk_blocks=%s block_size=%s | vision_layers=%s",
+            config.num_hidden_layers,
+            getattr(config, "sliding_window", None),
+            getattr(config, "num_nextn_predict_layers", 0),
+            compressors,
+            indexers,
+            engrams,
+            config.candidate_source_layer_id,
+            config.candidate_topk_blocks,
+            config.candidate_block_size,
+            config.vision_n_layers,
+        )
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -4200,9 +4288,7 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = torch.cat(
                         [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                     )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
-            ):
+            elif _should_use_breakable_attention(forward_batch):
                 hash_ids = bcg_deepseek_v4_engram_hash_ids(
                     self.engram_hasher, input_ids
                 )

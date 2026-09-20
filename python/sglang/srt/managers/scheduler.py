@@ -461,6 +461,12 @@ class Scheduler(
         # dedicated methods instead of adding inline blocks here.
         self.init_startup_timing_begin()
         self.is_initializing = True
+        if envs.SGLANG_MEM_HISTORY.get():
+            try:
+                torch.cuda.memory._record_memory_history(enabled="all")
+                logger.info("[MEM-HISTORY] memory history recording enabled")
+            except Exception:
+                pass
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
@@ -4335,6 +4341,17 @@ class Scheduler(
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
+        # Release the allocator's cached blocks before a prefill forward so a long
+        # request starts with the maximum free GPU memory. Without this,
+        # cross-request residual (~3GB after a burst of activity) plus the chunk's
+        # ~7GB working memory pushes past the 32GB limit and OOMs a long-context
+        # prefill at its first chunk (one sync per prefill batch).
+        if batch.forward_mode.is_extend() and envs.SGLANG_EMPTY_CACHE_PRE_PREFILL.get():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -4751,6 +4768,20 @@ class Scheduler(
             force=batch.forward_mode.is_extend(),
             snapshot=snapshot,
         )
+
+        # The prefill's working-memory peak is cached by the CUDA allocator
+        # (releasable ~8GB at large contexts). The high-water reserved plus the
+        # next chunk's large allocation exceeds 32GB at ~50% of an 800K prefill.
+        # Releasing the cache after every chunk keeps the reserved at the live
+        # level so the 800K prefill runs without OOM. Only fire when the reserved
+        # is high, so small-context prefills (which are faster) do not pay the
+        # empty_cache sync overhead.
+        if batch.forward_mode.is_extend() and envs.SGLANG_EMPTY_CACHE_PER_CHUNK.get():
+            try:
+                if torch.cuda.memory_reserved() / (1 << 30) > 30.0:
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

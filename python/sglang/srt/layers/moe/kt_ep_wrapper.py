@@ -2301,13 +2301,19 @@ class _Mxfp4LayerwisePrefillManager:
                 },
             )
         pinned = os.environ.get("SGLANG_MXFP4_HOST_CACHE_PINNED", "0") == "1"
+        # Sizes come from the layer's construction args, not from gpu_layer's
+        # weight shapes: _maybe_free_full_raw replaces the full-layer raw image
+        # with a zero-length placeholder once the host cache covers every layer,
+        # so the shapes are not a reliable source after the first layer loads.
+        # _build_mxfp4_host_cache_entry already treats these args as canonical.
+        hidden_size, intermediate_size, _ = method._full_init_args
         layer_cache = _build_mxfp4_host_cache_entry(
             method,
             layer_idx,
             pinned=pinned,
             num_experts=self.context.gpu_layer.num_experts,
-            hidden_size=self.context.gpu_layer.w13_weight.shape[2] * 2,
-            intermediate_size=self.context.gpu_layer.w2_weight.shape[2] * 2,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
         )
         if layer_cache is None:
             self._host_cache[layer_idx] = None
@@ -2418,9 +2424,13 @@ class _Mxfp4LayerwisePrefillManager:
             return
         with _MXFP4_EAGER_CACHE_LOCK:
             eager = _MXFP4_EAGER_HOST_CACHE.get(self.signature, {})
+            # A layer counts as covered only when a real cache dict exists for
+            # it. The eager map records None for a layer whose pack failed and
+            # holds no entry at all for one not built yet; both must keep the
+            # raw image alive, since the fallback path repacks from it.
             if not all(
                 self._host_cache.get(i) is not None
-                or eager.get(i, _UNSET) is not None
+                or eager.get(i) is not None
                 for i in self.layer_order
             ):
                 return
@@ -4041,14 +4051,43 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     return _KT_GPU_EXPERTS_MASKS
 
 
+def _select_kt_gpu_experts_mask(
+    masks: torch.Tensor, layer_idx: int, num_experts: Optional[int]
+) -> torch.Tensor:
+    """Pick the placement row describing one MoE layer.
+
+    ``masks`` is built from the served model's config, so it only describes that
+    model's layers. A draft/MTP stage is a separate, smaller MoE (V4.1: 128
+    routed experts against the target's 384) whose stage ids collide with target
+    layer ids, so the target's rows do not describe it. Such a layer keeps every
+    expert on CPU: the GPU budget is ``kt_num_gpu_experts * num_moe_layers`` over
+    the target's layers, and handing a layer GPU experts the budget never
+    counted would over-subscribe device memory.
+    """
+    if num_experts is None or masks.shape[1] == num_experts:
+        return masks[layer_idx]
+    logger.info(
+        "[kt-mask] layer %d has %d experts but the placement table describes %d; "
+        "keeping all %d of them on CPU.",
+        layer_idx,
+        num_experts,
+        masks.shape[1],
+        num_experts,
+    )
+    return torch.zeros(num_experts, dtype=torch.bool, device="cpu")
+
+
 def create_kt_config_from_server_args(
-    server_args: "ServerArgs", layer_idx: int
+    server_args: "ServerArgs", layer_idx: int, num_experts: Optional[int] = None
 ) -> Optional[KTConfig]:
     """Create KTConfig from ServerArgs if KT is configured.
 
     Args:
         server_args: Global server arguments
         layer_idx: Layer index in the model
+        num_experts: Routed experts of the layer being built. Layers whose
+            expert count differs from the placement table (draft/MTP stages) get
+            an all-CPU mask; see :func:`_select_kt_gpu_experts_mask`.
 
     Returns:
         KTConfig if KT is configured and not disabled, None otherwise
@@ -4079,7 +4118,7 @@ def create_kt_config_from_server_args(
     # Reverted; root cause is in V4 MoE weight layout vs sglang fused_moe.
 
     # Get mask for this specific layer
-    gpu_experts_mask = masks[layer_idx]
+    gpu_experts_mask = _select_kt_gpu_experts_mask(masks, layer_idx, num_experts)
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -5616,7 +5655,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 
 def _kt_ep_predicate(layer, server_args):
-    return create_kt_config_from_server_args(server_args, layer.layer_id)
+    return create_kt_config_from_server_args(
+        server_args, layer.layer_id, layer.num_local_experts
+    )
 
 
 def _kt_ep_factory(layer, gpu_method, kt_config):

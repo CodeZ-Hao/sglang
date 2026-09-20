@@ -426,6 +426,9 @@ class KVCacheConfigurator:
             c128_max_total_num_tokens = 0
             c4_state_pool_size = 0
             c128_state_pool_size = 0
+            draft_swa_override = envs.SGLANG_DSPARK_DRAFT_SWA_TOKENS.get()
+            if draft_swa_override > 0:
+                swa_max_total_num_tokens = draft_swa_override
         else:
             c4_max_total_num_tokens = config.c4_max_total_num_tokens
             c128_max_total_num_tokens = config.c128_max_total_num_tokens
@@ -2204,6 +2207,35 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+
+        # Unified memory-budget lock (SGLANG_PRE_COMMIT_MEMORY=1): force the KV
+        # pool's physical pages to be committed NOW (the buffers may otherwise be
+        # backed lazily as KV is written), so the OOM surfaces at startup instead
+        # of mid-prefill and admission sees the true physical budget. Draft
+        # worker pools are excluded (they are small/spec-only).
+        if not self.is_draft_worker and envs.SGLANG_PRE_COMMIT_MEMORY.get():
+            touched = 0
+            sub_pools = [
+                getattr(token_to_kv_pool, attr, None)
+                for attr in ("swa_kv_pool", "unified_kv_pool")
+            ]
+            sub_pools += list(getattr(token_to_kv_pool, "kv_pools", {}).values())
+            sub_pools += list(getattr(token_to_kv_pool, "index_pools", {}).values())
+            for sub in sub_pools:
+                if sub is None:
+                    continue
+                for buf in getattr(sub, "kv_buffer", ()) or ():
+                    if buf is not None:
+                        try:
+                            buf.fill_(0)
+                            touched += 1
+                        except Exception:
+                            pass
+            logger.info(
+                "[PRE_COMMIT] touched %d KV pool buffers; allocated=%.2f GB",
+                touched,
+                torch.cuda.memory_allocated() / (1 << 30),
+            )
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
