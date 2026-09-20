@@ -131,6 +131,10 @@ class ExpertDistributionRecorder(ABC):
     ):
         pass
 
+    def on_gpu_expert_mask(self, layer_idx: int, gpu_experts_mask: torch.Tensor):
+        """Record GPU expert mask for a layer (used by KT EP wrapper)."""
+        pass
+
     def start_record(self):
         self._on_not_implemented()
 
