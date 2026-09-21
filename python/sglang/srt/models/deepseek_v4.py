@@ -4262,7 +4262,7 @@ class DeepseekV4Model(nn.Module):
             config.q_lora_rank,
             config.o_groups,
             config.o_lora_rank,
-            config.qk_nope_head_dim + config.qk_rope_head_dim,
+            config.head_dim,
         )
 
     def get_input_embeddings(self) -> nn.Module:
