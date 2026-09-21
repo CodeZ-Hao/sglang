@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import add_prefix
 
 
@@ -63,9 +64,15 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
-        return torch.repeat_interleave(
-            req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
+        # Ragged verify gives each request its own verify length; without a
+        # layout the batch is equal blocks of draft_token_num.
+        layout = resolve_ragged_verify_layout(forward_batch)
+        lens = (
+            layout.verify_lens.to(torch.int64)
+            if layout is not None
+            else torch.full_like(req, int(forward_batch.spec_info.draft_token_num))
         )
+        return torch.repeat_interleave(req, lens, output_size=num_tokens)
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
