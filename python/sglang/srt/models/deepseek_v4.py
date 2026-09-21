@@ -4209,11 +4209,11 @@ class DeepseekV4Model(nn.Module):
         network than the one trained, so pin the shape down and log the
         geometry the kernels actually got.
         """
-        ratios = list(config.compress_ratios)
+        ratios = list(config.compress_ratios)[: config.num_hidden_layers]
         if len(ratios) != config.num_hidden_layers:
             raise RuntimeError(
-                f"compress_ratios has {len(ratios)} entries but the model has "
-                f"{config.num_hidden_layers} layers"
+                f"compress_ratios has {len(config.compress_ratios)} entries but the "
+                f"model has {config.num_hidden_layers} layers"
             )
         if config.num_hidden_layers % 2:
             raise RuntimeError(
