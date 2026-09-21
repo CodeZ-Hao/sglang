@@ -560,6 +560,23 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Propose the markov draft chain greedily (argmax per step) even when the
+    # request samples at temperature > 0. A sampled chain wanders off the modal
+    # path, and every wandering token conditions the next markov step, so the
+    # accept length collapses well below the greedy-verify level on
+    # temperature-bearing benchmarks. Mode-seeking proposals keep the chain on
+    # the path the target agrees with; see also the sampled-target verify mode
+    # SGLANG_DSPARK_SAMPLED_TARGET_VERIFY.
+    SGLANG_DSPARK_GREEDY_DRAFT = EnvBool(False)
+    # With greedy proposals under temperature, verify against a SAMPLED target
+    # token instead of running the ratio-based chain rejection sampler: accept
+    # iff the target's own sample equals the proposed token (per-position
+    # accept = p(argmax), the chain stays unbiased because every committed
+    # token is the target's sample). Raising the draft_probs ratio at
+    # q=softmax(corrected/T) adds a second rejection on top of the target's
+    # own sampling decision, which is what the greedy-proposal chain pays
+    # today. Only read when SGLANG_DSPARK_GREEDY_DRAFT is set.
+    SGLANG_DSPARK_SAMPLED_TARGET_VERIFY = EnvBool(True)
     # Fixed SWA token capacity for the DSPARK draft worker, independent of the
     # target's. 0 (default) keeps the target's size. The draft attends over one
     # sliding window plus its own draft tokens, so it fits in a smaller pool; too

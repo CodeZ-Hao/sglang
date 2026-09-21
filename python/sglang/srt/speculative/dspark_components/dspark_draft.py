@@ -149,6 +149,13 @@ def sample_draft_block(
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
         )
 
+    # Mode-seeking proposals: sample the chain greedily even for temperature
+    # requests (SGLANG_DSPARK_GREEDY_DRAFT). A sampled markov chain conditions
+    # step k on the (possibly off-mode) token sampled at step k-1, compounding
+    # divergence; the argmax chain stays on the path the target verify agrees
+    # with. draft_probs for the accept kernel stay softmax(corrected_logits/T).
+    any_sampling = any_sampling and not envs.SGLANG_DSPARK_GREEDY_DRAFT.get()
+
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -257,6 +264,14 @@ class DraftBlockProposer:
         )
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        # Mode-seeking proposals (SGLANG_DSPARK_GREEDY_DRAFT): see
+        # sample_draft_block for why the chain is argmax'd under temperature.
+        # A folded sampler with sampling buffers would Gumbel-sample the chain
+        # in-graph, bypassing that env; treat it as unusable so the proposal
+        # falls back to the eager greedy path.
+        greedy_draft = envs.SGLANG_DSPARK_GREEDY_DRAFT.get()
+        if greedy_draft and draft_sampler is not None and draft_sampler.folded_sampling:
+            draft_sampler = None
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,

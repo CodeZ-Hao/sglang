@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
+    CapCorrectLen,
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
@@ -31,7 +32,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -41,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
@@ -834,6 +839,51 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
+    # Greedy proposals + sampled-target verify (SGLANG_DSPARK_GREEDY_DRAFT +
+    # SGLANG_DSPARK_SAMPLED_TARGET_VERIFY): every proposed token is the draft
+    # argmax, so the honest accept test is "does the target's own sample equal
+    # the proposal". Sample the target once per position (argmax on greedy
+    # rows) and run the greedy chain rule against it: per-position accept =
+    # p(argmax), and every committed token (accepted draft or the position's
+    # sample on mismatch) is the target's own draw, so the output distribution
+    # stays the target's for both row kinds.
+    if (
+        envs.SGLANG_DSPARK_GREEDY_DRAFT.get()
+        and envs.SGLANG_DSPARK_SAMPLED_TARGET_VERIFY.get()
+    ):
+        bs_rows = candidates.shape[0] * verify_num_draft_tokens
+        target_probs = SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        ).view(bs_rows, -1)
+        # Gumbel-max: argmax(p / Exp(1) noise) is an exact draw from p, one
+        # noise row per target row. Greedy rows keep the plain argmax.
+        exp_noise = torch.empty_like(target_probs).exponential_(1)
+        sampled = torch.argmax(target_probs / exp_noise, dim=-1)
+        if sampling_info.is_any_greedy:
+            argmaxed = torch.argmax(target_probs, dim=-1)
+            row_greedy = greedy_mask.view(-1)
+            sampled = torch.where(row_greedy, argmaxed, sampled)
+        target_predict = sampled.view(
+            candidates.shape[0], verify_num_draft_tokens
+        )
+        correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates,
+            target_predict=target_predict,
+        )
+        cap_trim_lens = torch.zeros_like(correct_len)
+        if cutoff_verify_lens is not None:
+            correct_len, cap_trim_lens = CapCorrectLen.execute(
+                correct_len=correct_len, verify_lens=cutoff_verify_lens
+            )
+            row_ids = torch.arange(
+                candidates.shape[0], device=target_predict.device
+            )
+            bonus = target_predict[row_ids, correct_len.to(torch.long)].to(
+                torch.int64
+            )
+        return correct_len, bonus, cap_trim_lens
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
