@@ -3036,6 +3036,53 @@ class _Mxfp4LayerwisePrefillManager:
         return result
 
 
+def _interleave_host_cache(layer_cache: Dict[str, torch.Tensor]) -> None:
+    """Spread the pinned host cache over every NUMA node before pinning.
+
+    The scheduler thread (and everything it spawns) inherits kt-kernel's
+    node-0 ``MPOL_BIND``; a ~7 GiB pinned layer allocated from it lands
+    entirely on node 0 and the box OOM-kills the scheduler with node 1 free
+    (measured 2026-09-21: ``nodemask=0`` on the OOM line). Mirrors the engram
+    host table's fix (layers/engram.py::_interleave_across_nodes).
+    """
+    import ctypes
+
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+    except OSError:
+        logger.warning(
+            "[SLOTLOAD] libnuma unavailable; the pinned host cache follows the "
+            "thread's memory policy and may not fit on one node"
+        )
+        return
+    libnuma.numa_num_configured_nodes.restype = ctypes.c_int
+    libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+    libnuma.numa_bitmask_setbit.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    libnuma.numa_interleave_memory.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    )
+    libnuma.numa_bitmask_free.argtypes = (ctypes.c_void_p,)
+    nodes = libnuma.numa_num_configured_nodes()
+    if nodes < 2:
+        return
+    mask = libnuma.numa_allocate_nodemask()
+    if not mask:
+        return
+    try:
+        for node in range(nodes):
+            libnuma.numa_bitmask_setbit(ctypes.c_void_p(mask), node)
+        for t in layer_cache.values():
+            libnuma.numa_interleave_memory(
+                ctypes.c_void_p(t.data_ptr()),
+                ctypes.c_size_t(t.numel() * t.element_size()),
+                ctypes.c_void_p(mask),
+            )
+    finally:
+        libnuma.numa_bitmask_free(ctypes.c_void_p(mask))
+
+
 def _build_mxfp4_host_cache_entry(
     method,
     layer_idx: int,
@@ -3091,7 +3138,6 @@ def _build_mxfp4_host_cache_entry(
                 shapes[name],
                 dtype=host_dtypes[name],
                 device="cpu",
-                pin_memory=pinned,
             )
             for name in _Mxfp4PrefillSlot.RAW_NAMES
         }
@@ -3167,6 +3213,29 @@ def _build_mxfp4_host_cache_entry(
                 exc_info=True,
             )
             return None
+    if pinned:
+        # Pin AFTER the pack: cudaHostRegister locks the pages that already
+        # hold the weights (cost ~2.5% page tables) instead of paying
+        # pin_memory=True for a second copy of every layer. The interleave
+        # must run before any page is faulted, so it is first.
+        _interleave_host_cache(layer_cache)
+        for name, tensor in layer_cache.items():
+            err = torch.cuda.cudart().cudaHostRegister(
+                tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
+            )
+            if int(err) != 0:
+                logger.warning(
+                    "[SLOTLOAD] layer=%d cudaHostRegister(%s) failed (err %s); "
+                    "the layer stays pageable.",
+                    layer_idx,
+                    name,
+                    int(err),
+                )
+                for prev_name, prev in layer_cache.items():
+                    if prev_name == name:
+                        break
+                    torch.cuda.cudart().cudaHostUnregister(prev.data_ptr())
+                return None
     return layer_cache
 
 
