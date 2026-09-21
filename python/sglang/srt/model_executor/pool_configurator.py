@@ -1123,6 +1123,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
+        self._log_kv_layout_choice()
         if self.is_speculative and not self.encoder_replay:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
@@ -1255,6 +1256,42 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers_ca4
+        )
+
+    def _log_kv_layout_choice(self) -> None:
+        """Say which main-KV layout the pool got and what it costs per token.
+
+        The paper's FP4 main cache (§2.4.4) is an SM100/103 FlashMLA format.
+        Anywhere else the pool silently falls back to the FP8 V4 layout, so the
+        measured footprint is ~2x the paper's with nothing in the log to say
+        why. This is also the number that feeds the indexer's bmm width.
+        """
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            select_dsv4_kv_layout,
+        )
+
+        layout, option = select_dsv4_kv_layout()
+        if layout is KVLayout.V4:
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                reason = (
+                    "FP4 main KV (paper 2.4.4) needs SM100/103; this GPU is "
+                    f"SM{major}{minor}"
+                )
+            else:
+                reason = "no CUDA device visible"
+        else:
+            reason = "native V4.1 layout"
+        logger.info(
+            "DSV4 main KV layout: %s (compressed=%s) | %d B/token main "
+            "(un-inflated) | swa %s B/token | indexer %s B/token | %s",
+            layout.name,
+            option,
+            self.kv_bytes,
+            self.bytes_per_swa_token,
+            self.indexer_bytes_per_token,
+            reason,
         )
 
     def _get_bytes_per_full_token(self) -> float:

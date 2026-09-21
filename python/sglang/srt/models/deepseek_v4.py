@@ -4182,6 +4182,8 @@ class DeepseekV4Model(nn.Module):
                     f"config declares {want}"
                 )
 
+        self._verify_v41_ced_split(config)
+
         logger.info(
             "DeepSeek-V4.1 feature map: layers=%d swa=%s nextn=%s | "
             "compressor=%s indexer=%s engram=%s | candidate source=%s "
@@ -4196,6 +4198,71 @@ class DeepseekV4Model(nn.Module):
             config.candidate_topk_blocks,
             config.candidate_block_size,
             config.vision_n_layers,
+        )
+
+    def _verify_v41_ced_split(self, config: DeepSeekV4Config) -> None:
+        """Assert the CED encoder/decoder split and the CSA2 geometry.
+
+        The split is not a field anywhere: it is implied by `compress_ratios`
+        (0 = pure SWA, >0 = CSA2) and by `kv_source_layer_ids`. A mis-sized
+        checkpoint would load and serve coherent text while running a different
+        network than the one trained, so pin the shape down and log the
+        geometry the kernels actually got.
+        """
+        ratios = list(config.compress_ratios)
+        if len(ratios) != config.num_hidden_layers:
+            raise RuntimeError(
+                f"compress_ratios has {len(ratios)} entries but the model has "
+                f"{config.num_hidden_layers} layers"
+            )
+        if config.num_hidden_layers % 2:
+            raise RuntimeError(
+                f"the CED split needs an even layer count, got "
+                f"{config.num_hidden_layers}"
+            )
+        half = config.num_hidden_layers // 2
+        encoder, decoder = ratios[:half], ratios[half:]
+        if 0 in decoder:
+            raise RuntimeError(
+                f"every decoder layer must run CSA2; compress_ratios={ratios}"
+            )
+        if any(r == 0 for r in encoder[2:]) or any(r != 0 for r in encoder[:2]):
+            raise RuntimeError(
+                f"the encoder must open with exactly two pure-SWA layers; "
+                f"encoder compress_ratios={encoder}"
+            )
+
+        # The decoder's global KV is projected from H_(L/2), so the projection
+        # must live on the FIRST decoder layer: its input hidden state is the
+        # last encoder layer's output.
+        source = max(config.kv_source_layer_ids)
+        if source != half:
+            raise RuntimeError(
+                f"the last kv_source layer must be the first decoder layer "
+                f"({half}) so its input hidden state is H_(L/2); got {source}"
+            )
+        if ratios[source] == 0:
+            raise RuntimeError(
+                f"kv_source layer {source} must run CSA2, not pure SWA"
+            )
+
+        logger.info(
+            "DeepSeek-V4.1 CED split: encoder=%d decoder=%d | encoder ratios=%s "
+            "| decoder ratios=%s | kv_source=%s index_source=%s | indexer "
+            "%dhx%d topk=%d | q_lora=%d o_groups=%d o_rank=%d v_head=%d",
+            half,
+            half,
+            encoder,
+            decoder,
+            list(config.kv_source_layer_ids),
+            list(config.index_source_layer_ids),
+            config.index_n_heads,
+            config.index_head_dim,
+            config.index_topk,
+            config.q_lora_rank,
+            config.o_groups,
+            config.o_lora_rank,
+            config.v_head_dim,
         )
 
     def get_input_embeddings(self) -> nn.Module:
