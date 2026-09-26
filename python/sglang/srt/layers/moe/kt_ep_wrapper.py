@@ -55,7 +55,7 @@ from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
-from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils import is_cuda
 
 if is_cuda():
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -296,6 +296,112 @@ _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
+
+# --- Per-layer logical-expert route histogram (measurement only) -------------
+# The ExpertDistributionRecorder cannot see this path: with --kt-weight-path the
+# routed experts are dispatched here, and on this tree the recorder's
+# select_experts hook is reached only by the MTP draft (measured 2026-09-22: a
+# full decode run logged 2 hook calls, both layer_idx=None, both from
+# dspark_draft).  `KT_ROUTE_HIST=<path>` accumulates the routing here instead,
+# at the point where the logical (pre-remap) topk ids are still in hand, keyed
+# by (phase, layer) with phase split by token count.  The histogram is
+# rewritten to <path> every _KT_ROUTE_HIST_DUMP_EVERY notes; creating
+# <path>.reset zeroes the accumulators (to separate runs inside one server
+# life).  Inert unless the env var is set, and no launcher sets it.
+_KT_ROUTE_HIST_PATH = os.environ.get("KT_ROUTE_HIST")
+_KT_ROUTE_HIST: Dict[str, torch.Tensor] = {}
+_KT_ROUTE_HIST_NOTES = 0
+_KT_ROUTE_HIST_DUMP_EVERY = 200
+_KT_ROUTE_HIST_DECODE_TOKENS = 16  # num_tokens <= this is a decode step
+
+
+def kt_route_hist_note(
+    layer_idx: int, num_experts: int, num_tokens: int, topk_ids
+) -> None:
+    """Accumulate one layer's routing into the KT_ROUTE_HIST histogram.
+
+    Keyed by "<phase>/<num_experts>/<layer>" so the MTP draft's 128-expert
+    layers stay separate from the target's 384-expert ones.
+    """
+    global _KT_ROUTE_HIST_NOTES
+    if _KT_ROUTE_HIST_PATH is None:
+        return
+    phase = "decode" if num_tokens <= _KT_ROUTE_HIST_DECODE_TOKENS else "prefill"
+    ids = topk_ids.detach().reshape(-1).to(torch.long)
+    ids = ids[ids >= 0]
+    if ids.numel() == 0:
+        return
+    bc = torch.bincount(ids.cpu())
+    key = f"{phase}/{int(num_experts)}/{int(layer_idx)}"
+    acc = _KT_ROUTE_HIST.get(key)
+    if acc is None:
+        acc = torch.zeros(bc.numel())
+        _KT_ROUTE_HIST[key] = acc
+    elif acc.numel() < bc.numel():
+        padded = torch.zeros(bc.numel())
+        padded[: acc.numel()] = acc
+        acc = padded
+        _KT_ROUTE_HIST[key] = acc
+    acc[: bc.numel()] += bc
+    _KT_ROUTE_HIST_NOTES += 1
+    if _KT_ROUTE_HIST_NOTES % _KT_ROUTE_HIST_DUMP_EVERY == 0:
+        _kt_route_hist_dump()
+
+
+_DISTINCT_STATS: Dict[str, List[float]] = {}
+_DISTINCT_NOTES = 0
+_DISTINCT_PRINT_EVERY = 200
+
+
+def kt_distinct_note(num_experts: int, num_tokens: int, topk_ids) -> None:
+    """Mean DISTINCT experts per layer per call, gated by KT_DISTINCT_STATS=1.
+
+    The CPU MoE reads one expert's weights per *distinct* expert a step routes
+    to, so this -- not the token count -- is what sizes its bytes.  It is also
+    the number the step's wall time does not show: the wait for the CPU experts
+    is a device-side event on `_sync_done_event`, so it lands in GPU idle time,
+    while the host's own `cpu_wait` stays near zero (0.04 ms/layer measured).
+    Averaged over layers, split by phase, with the routes/call beside it so the
+    amortization per read is visible.
+    """
+    global _DISTINCT_NOTES
+    if not os.environ.get("KT_DISTINCT_STATS") or num_tokens <= 0:
+        return
+    ids = topk_ids.detach().reshape(-1)
+    ids = ids[ids >= 0]
+    if ids.numel() == 0:
+        return
+    counts = torch.bincount(ids.cpu())
+    if counts.numel() > num_experts:
+        counts = counts[:num_experts]
+    distinct = int(counts.count_nonzero())
+    phase = "decode" if num_tokens <= _KT_ROUTE_HIST_DECODE_TOKENS else "prefill"
+    acc = _DISTINCT_STATS.setdefault(f"{phase}/{int(num_experts)}", [0.0, 0.0, 0.0])
+    acc[0] += 1
+    acc[1] += distinct
+    acc[2] += int(ids.numel())
+    _DISTINCT_NOTES += 1
+    if _DISTINCT_NOTES % _DISTINCT_PRINT_EVERY == 0:
+        parts = " ".join(
+            f"{k} n={int(v[0])} distinct/layer={v[1] / v[0]:.2f} routes/layer={v[2] / v[0]:.1f}"
+            for k, v in sorted(_DISTINCT_STATS.items())
+        )
+        print(f"[distinct] {parts}", flush=True)
+
+
+def _kt_route_hist_dump() -> None:
+    reset_marker = Path(_KT_ROUTE_HIST_PATH + ".reset")
+    if reset_marker.exists():
+        _KT_ROUTE_HIST.clear()
+        try:
+            reset_marker.unlink()
+        except OSError:
+            pass
+    out = {key: [int(x) for x in counts] for key, counts in _KT_ROUTE_HIST.items()}
+    tmp = Path(_KT_ROUTE_HIST_PATH + ".tmp")
+    tmp.write_text(json.dumps(out))
+    os.replace(tmp, _KT_ROUTE_HIST_PATH)
+
 # Eager host-weight cache build (TP1 layerwise prefill).  The KT pack + the
 # cudaHostAlloc of a fresh 3.6GB pinned buffer cost ~0.9s/layer on this box, so
 # a synchronous per-layer build during the cold first prefill caps prefill at
@@ -331,14 +437,104 @@ def _is_cuda_oom(exc: Optional[BaseException]) -> bool:
 
 # Experts per H2D/repack batch for the host-cache layerwise path (baseline
 # host staging: raw on CPU, GPU keeps 1 prepared slot + a small staging).
-# 64 balances repack launch overhead vs. staging footprint (0.94 GiB).
-BATCH_EXPERTS = 16
+#
+# Once the H2D and the repack overlap (two staging buffers + two streams, see
+# _repack_from_cache) this only trades staging VRAM against per-batch launch
+# count, because the repack cost per expert is independent of the batch size.
+# 16 keeps the pair of buffers at 0.47 GiB, which is what the ~8 GiB of
+# headroom left after the slots can afford.  Raising it to 32 measured +3.9%
+# while the two were still serialized on one stream; 64 did not fit VRAM at all
+# (it OOM'd the first layerwise batch on this 32 GB card).
+#
+# SGLANG_MXFP4_BATCH_EXPERTS overrides it.  The reason to lower it is VRAM, not
+# throughput: the staging footprint is 2 x BATCH_EXPERTS experts, so halving the
+# batch frees 0.47 GiB, which is what chunk 32768 needs on top of chunk 16384's
+# 8.34 GiB of post-slot headroom (measured: 8.10 free at 32768 against a ~8.2
+# GiB batch requirement).  A bigger chunk is worth far more than the extra
+# launches cost, because the 21 x 7.6 GiB weight transfer is per-CHUNK.
+BATCH_EXPERTS = max(1, int(os.environ.get("SGLANG_MXFP4_BATCH_EXPERTS", "16")))
+# Expert ranges the prepared slot is split into so the host->GPU transfer of the
+# next range overlaps the GPU compute of the current one.  **Measured twice, and
+# the default is 1: the split buys nothing.**  The routing compaction that removes
+# the GEMM inflation (see below) does work -- R=2 costs 103.8 ms against the dense
+# call's 95.6 where the shipped sanitizer split cost 173.7 -- and PR=2 is STILL
+# 2-3% slower end to end (three paired probes: 1414.5/1427.1 against
+# 1390.2/1365.3), because the split cannot shorten what the period actually is.
+#
+# What the period is, from the stage events (SGLANG_LAYERWISE_STAGE_DEBUG=1):
+# per encoder layer the transfer stream is busy 425-525 ms moving the layer's
+# 7.65 GB off the host cache, the grouped GEMM plus its non-MoE neighbours span
+# 330-385 ms on the compute stream, and start-to-start `period` comes out 516-550
+# ms -- at PR=1 and PR=2 alike.  So **period ~= xfer span + ~50 ms**, the GEMM is
+# already hidden behind the H2D, and the split only adds a second range's worth of
+# launches and accumulator work.  The lever is the H2D rate, not the schedule:
+# 7.65 GB in ~480 ms is 15.9 GB/s on a Gen4 x16 link that does ~26.7.
+#
+# History: the split was -11% before the compaction (the sanitizer-sized GEMM
+# inflated 264 -> 425 ms/layer, reproduced at chunk 32768: 1379 -> 1228) and -2%
+# after, i.e. compaction removed the inflation without turning the split into a
+# win.  `PIPELINE_RANGES` and the compaction both stay: the compaction is what
+# makes the split's cost legible, and the switch stays so the overlap can be
+# re-measured if the transfer stops being the critical path.  The other upstream
+# alternative -- a second whole-layer prepared slot so no split is needed -- needs
+# another 6.72 GiB and does not fit (measured: 0.65 GiB free at chunk 16384 with
+# the slots resident).
+PIPELINE_RANGES = max(
+    1, int(os.environ.get("SGLANG_MXFP4_LAYERWISE_PIPELINE_RANGES", "1"))
+)
+# Staging buffers per pipeline range, and the experts each holds.  Two per
+# range keeps the H2D of one batch overlapped with the Marlin repack of the
+# previous one (see the staging_buffers note in the layerwise manager).  The
+# expert count is divided rather than the pool grown so the total staging
+# footprint matches the 2 x BATCH_EXPERTS it replaces.
+STAGING_BUFFERS_PER_RANGE = 2
+STAGING_EXPERTS = max(1, BATCH_EXPERTS // PIPELINE_RANGES)
 # Free GPU bytes required before the layerwise pipeline auto-re-enables after
 # an OOM teardown (prepared 3.19 GiB + staging 0.94 GiB + ~2 GiB margin for a
 # short prefill's chunk working memory).  Keeps short layerwise-qualified
 # prefills from staying stuck on CPU MoE for the whole session after one
 # long-context OOM.
 _MXFP4_LAYERWISE_REENABLE_BYTES = int(6.5 * 1024**3)
+
+# Diagnostic only: SGLANG_LAYERWISE_MEM_DEBUG=1 logs the torch allocator's
+# free/allocated/reserved/peak around the first few layerwise applies.  This is
+# how the per-batch working-memory requirement is measured -- that number is
+# what decides whether a second prepared slot (the transfer/compute overlap)
+# fits on the card, so it is worth being able to read it directly instead of
+# inferring it from an OOM message.  Bounded by default; off in production.
+_MXFP4_LAYERWISE_MEM_DEBUG = os.environ.get("SGLANG_LAYERWISE_MEM_DEBUG") == "1"
+_MXFP4_LAYERWISE_MEM_DEBUG_LEFT = 32
+
+# Diagnostic only: SGLANG_LAYERWISE_STAGE_DEBUG=1 splits one layerwise layer into
+# its device-side stages -- the H2D span on the transfer stream, the trailing
+# Marlin repack, the grouped GEMM span on the compute stream, and the layer
+# period -- and logs them for the first few layers.  Reading the events is
+# deferred to the next layer and skipped unless they have completed, so the
+# measurement does not synchronize anything and does not perturb the pipeline it
+# is measuring.
+_MXFP4_LAYERWISE_STAGE_DEBUG = os.environ.get("SGLANG_LAYERWISE_STAGE_DEBUG") == "1"
+_MXFP4_LAYERWISE_STAGE_LEFT = 60
+
+# Whether the intra-layer pipeline is actually active is the one fact every prefill
+# measurement depends on, and nothing else records it: `PIPELINE_RANGES` is read from
+# the environment at import, and a leg that fails to pass it through silently measures
+# the shipped single-range path twice.  Logged once, unconditionally.
+_PIPELINE_RANGES_LOGGED = False
+
+
+def _log_pipeline_ranges(ranges) -> None:
+    """Log the effective intra-layer expert split, once per process."""
+    global _PIPELINE_RANGES_LOGGED
+    if _PIPELINE_RANGES_LOGGED:
+        return
+    _PIPELINE_RANGES_LOGGED = True
+    logger.info(
+        "[lwranges] PIPELINE_RANGES=%d ranges=%s staging_experts=%d staging_buffers=%d",
+        PIPELINE_RANGES,
+        ranges,
+        STAGING_EXPERTS,
+        STAGING_BUFFERS_PER_RANGE * PIPELINE_RANGES,
+    )
 
 # Per-thread slot index used by SharedStagingBuffer.get_slice (0 = main thread,
 # 1 = PD-parallel second channel). Set by the channel thread. Local addition.
@@ -466,6 +662,22 @@ def get_or_create_shared_staging_buffer(
     return _SHARED_STAGING_BUFFER
 
 
+def _layer_device(layer: torch.nn.Module) -> torch.device:
+    """Device of `layer`, tolerating a layer whose parameters are all gone.
+
+    `KT_PREFILL_RELEASE_RESIDENTS=1` sets a resident layer's raw weight attrs to
+    None (testable via `hasattr`, which the layerwise gate depends on), which
+    leaves `layer.parameters()` empty and turns a plain `.device` read into a
+    StopIteration.  That has now killed a prefill (through `_apply_impl`) and the
+    layerwise slot setup, and every caller here only wants a device, so fall back
+    to the current CUDA device instead of propagating.
+    """
+    try:
+        return next(layer.parameters()).device
+    except StopIteration:
+        return torch.device("cuda", torch.cuda.current_device())
+
+
 class SharedFullContext:
     def __init__(
         self,
@@ -522,7 +734,7 @@ class SharedFullContext:
         )
 
         hidden_size, intermediate_size_per_partition, params_dtype = init_args
-        target_device = next(layer.parameters()).device
+        target_device = _layer_device(layer)
 
         # Create gpu_layer as a shallow copy, then override specific attributes
         self.gpu_layer = copy.copy(layer)
@@ -992,18 +1204,23 @@ class SharedFullContext:
         allocation_error = None
         try:
             for name in self.weight_names:
-                gpu_tensor = getattr(self.gpu_layer, name)
-                # Only allocate 2 experts worth of buffer (double buffering)
-                expert_shape = gpu_tensor.shape[1:]  # Shape per expert
+                # Size from the frozen snapshot: the full-layer raw may already
+                # be freed (see _allocate_mxfp4_slot_storage) and would read as
+                # an empty Parameter, collapsing the SHM to 0 bytes.
+                _shape, _w_dtype, _w_device = self._raw_weight_shapes[name]
+                expert_shape = _shape[1:]
                 if (
                     getattr(self, "_is_mxfp4_quant", False)
                     and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
                 ):
                     buf_dtype = torch.bfloat16
                 else:
-                    buf_dtype = gpu_tensor.dtype
+                    buf_dtype = _w_dtype
                 element_size = torch.empty((), dtype=buf_dtype).element_size()
-                expert_nbytes = gpu_tensor.numel() // num_experts * element_size
+                _numel = 1
+                for _d in _shape:
+                    _numel *= _d
+                expert_nbytes = _numel // num_experts * element_size
                 double_buf_nbytes = expert_nbytes * 2
 
                 shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
@@ -1319,19 +1536,25 @@ class SharedFullContext:
         gpu_expert_ids = []
         cpu_expert_ids = []
         if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
-            for e in range(num_experts):
-                if gpu_experts_mask[e].item():
-                    gpu_expert_ids.append(e)
-                else:
-                    cpu_expert_ids.append(e)
+            # ONE host readback for the whole mask.  The per-expert `gpu_experts_mask[e].item()`
+            # this replaces is a synchronizing DtoH, so the loop cost `num_experts` pipeline drains
+            # per layer -- and this path runs once per layer in the layerwise prefill, i.e. 384 x 40
+            # = 15360 drains per chunk (at --kt-num-gpu-experts 0 the mask is all-False, so every
+            # one of them is a wasted sync).  Same values, one sync.
+            mask_host = gpu_experts_mask.cpu().tolist()
+            gpu_expert_ids = [e for e, m in enumerate(mask_host) if m]
+            cpu_expert_ids = [e for e in range(num_experts) if not mask_host[e]]
         else:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
         if gpu_expert_ids:
+            # One readback, then index it: `logical_to_gpu_index[e].item()` inside the loop is a
+            # synchronizing DtoH per GPU expert.
+            gpu_index_host = logical_to_gpu_index.cpu().tolist()
             for e in gpu_expert_ids:
-                gpu_idx = logical_to_gpu_index[e].item()
+                gpu_idx = gpu_index_host[e]
                 for name, _, dst in weight_infos:
                     src = getattr(original_layer, name)  # [num_gpu_experts, ...]
                     dst[e].copy_(src[gpu_idx], non_blocking=True)
@@ -1567,19 +1790,25 @@ class SharedFullContext:
         gpu_expert_ids = []
         cpu_expert_ids = []
         if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
-            for e in range(num_experts):
-                if gpu_experts_mask[e].item():
-                    gpu_expert_ids.append(e)
-                else:
-                    cpu_expert_ids.append(e)
+            # ONE host readback for the whole mask.  The per-expert `gpu_experts_mask[e].item()`
+            # this replaces is a synchronizing DtoH, so the loop cost `num_experts` pipeline drains
+            # per layer -- and this path runs once per layer in the layerwise prefill, i.e. 384 x 40
+            # = 15360 drains per chunk (at --kt-num-gpu-experts 0 the mask is all-False, so every
+            # one of them is a wasted sync).  Same values, one sync.
+            mask_host = gpu_experts_mask.cpu().tolist()
+            gpu_expert_ids = [e for e, m in enumerate(mask_host) if m]
+            cpu_expert_ids = [e for e in range(num_experts) if not mask_host[e]]
         else:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
         if gpu_expert_ids:
+            # One readback, then index it: `logical_to_gpu_index[e].item()` inside the loop is a
+            # synchronizing DtoH per GPU expert.
+            gpu_index_host = logical_to_gpu_index.cpu().tolist()
             for e in gpu_expert_ids:
-                gpu_idx = logical_to_gpu_index[e].item()
+                gpu_idx = gpu_index_host[e]
                 for name, _, dst in weight_infos:
                     src = getattr(original_layer, name)  # [num_gpu_experts, ...]
                     dst[e].copy_(src[gpu_idx], non_blocking=True)
@@ -1732,19 +1961,25 @@ class SharedFullContext:
         gpu_expert_ids = []
         cpu_expert_ids = []
         if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
-            for e in range(num_experts):
-                if gpu_experts_mask[e].item():
-                    gpu_expert_ids.append(e)
-                else:
-                    cpu_expert_ids.append(e)
+            # ONE host readback for the whole mask.  The per-expert `gpu_experts_mask[e].item()`
+            # this replaces is a synchronizing DtoH, so the loop cost `num_experts` pipeline drains
+            # per layer -- and this path runs once per layer in the layerwise prefill, i.e. 384 x 40
+            # = 15360 drains per chunk (at --kt-num-gpu-experts 0 the mask is all-False, so every
+            # one of them is a wasted sync).  Same values, one sync.
+            mask_host = gpu_experts_mask.cpu().tolist()
+            gpu_expert_ids = [e for e, m in enumerate(mask_host) if m]
+            cpu_expert_ids = [e for e in range(num_experts) if not mask_host[e]]
         else:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
         if gpu_expert_ids:
+            # One readback, then index it: `logical_to_gpu_index[e].item()` inside the loop is a
+            # synchronizing DtoH per GPU expert.
+            gpu_index_host = logical_to_gpu_index.cpu().tolist()
             for e in gpu_expert_ids:
-                gpu_idx = logical_to_gpu_index[e].item()
+                gpu_idx = gpu_index_host[e]
                 for name, _, dst in weight_infos:
                     src = getattr(original_layer, name)  # [num_gpu_experts, ...]
                     dst[e].copy_(src[gpu_idx], non_blocking=True)
@@ -1890,8 +2125,16 @@ class SharedFullContext:
         if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
-            self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
-                                       logical_to_gpu_index)
+            if _KT_RESIDENTS_RAW_RELEASED:
+                # The resident experts' raw slice was given up to the layerwise slot
+                # (KT_PREFILL_RELEASE_RESIDENTS).  Phase 1 would read it to copy the
+                # residents D2D, so route EVERY expert through the CPU staging path
+                # instead -- that is the `original_layer=None` branch, and Phase 2
+                # already pulls all 384 experts from the KT host pool.
+                self._prepare_weight_mxfp4(wrapper, None, None, None)
+            else:
+                self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
+                                           logical_to_gpu_index)
         elif getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8: byte-copy via FP8 path with original_layer=None
             # (Phase 1 shortcut disabled) + Triton MXFP8->block-FP8 convert
@@ -1944,6 +2187,8 @@ class _Mxfp4PrefillSlot:
         raw_tensors: Dict[str, torch.Tensor],
         marlin_prepared,
         num_experts: Optional[int] = None,
+        *,
+        frozen_shapes: Dict[str, tuple],
     ):
         self.index = index
         for name in self.RAW_NAMES:
@@ -1959,12 +2204,31 @@ class _Mxfp4PrefillSlot:
         self.raw_ready_event = torch.cuda.Event()
         self.ready_event = torch.cuda.Event()
         self.consumed_event = torch.cuda.Event()
+        # Per-range pipeline fences (see PIPELINE_RANGES).  range_ready_event[r]
+        # is recorded on the postprocess stream when range r's Marlin repack
+        # lands; the compute stream waits on it before computing that range.
+        self.range_ready_event = [
+            torch.cuda.Event() for _ in range(PIPELINE_RANGES)
+        ]
+        # The expert ranges ([start, count) pairs) the cache path pipelines, or
+        # None for a single whole-layer range -- the SHM path, which writes the
+        # raw slot directly and has no repack to overlap.  Set by _load_slot,
+        # together with the host cache and GPU-expert list the later ranges are
+        # repacked from in apply().
+        self.pipeline_ranges: Optional[List[tuple]] = None
+        self.layer_cache: Optional[Dict[str, torch.Tensor]] = None
+        self.range_gpu_expert_ids: List[int] = []
 
-        self.intermediate_size = self.w2_weight.shape[2] * 2
+        # Sizes come from the context's frozen snapshot, never from the live
+        # tensors: with SGLANG_KT_SLOT_FREE_RAW_FIRST the full-layer raw is
+        # freed before the manager is built, and its placeholder .shape is (0,)
+        # -- reading shape[2] off that was the manager-setup IndexError that
+        # killed the first layerwise prefill attempt.
+        self.intermediate_size = frozen_shapes["w2_weight"][0][2] * 2
         if num_experts is not None:
             self.num_experts = num_experts
         else:
-            self.num_experts = self.w13_weight.shape[0]
+            self.num_experts = frozen_shapes["w13_weight"][0][0]
 
     def invalidate(self) -> None:
         # Keep the prepared tensors alive.  Their backing may still be in use on
@@ -2000,12 +2264,27 @@ class _Mxfp4LayerwisePrefillManager:
             # Single-slot mode (VRAM-constrained): no successor prefetch, but
             # host staging still alternates 2 slots for CPU->GPU transfers.
             self.slots = (
-                _Mxfp4PrefillSlot(0, slot0_raw, slot_marlin_prepared[0]),
+                _Mxfp4PrefillSlot(
+                    0,
+                    slot0_raw,
+                    slot_marlin_prepared[0],
+                    frozen_shapes=context._raw_weight_shapes,
+                ),
             )
         else:
             self.slots = (
-                _Mxfp4PrefillSlot(0, slot0_raw, slot_marlin_prepared[0]),
-                _Mxfp4PrefillSlot(1, slot1_raw_tensors, slot_marlin_prepared[1]),
+                _Mxfp4PrefillSlot(
+                    0,
+                    slot0_raw,
+                    slot_marlin_prepared[0],
+                    frozen_shapes=context._raw_weight_shapes,
+                ),
+                _Mxfp4PrefillSlot(
+                    1,
+                    slot1_raw_tensors,
+                    slot_marlin_prepared[1],
+                    frozen_shapes=context._raw_weight_shapes,
+                ),
             )
         # Host staging slot count is independent of the layerwise compute
         # slots: keep 2 so CPU->GPU transfers stay pipelined (a single host
@@ -2032,20 +2311,75 @@ class _Mxfp4LayerwisePrefillManager:
         self._host_cache: Dict[int, Optional[Dict[str, torch.Tensor]]] = {}
         self._host_cache_lock = threading.Lock()
         self._cache_dtypes_logged = False
-        # Small GPU staging buffer (BATCH_EXPERTS experts) for the cache path:
-        # the full-layer raw image (3.75 GiB) is NOT materialized on GPU; each
-        # batch is H2D'd from the host cache, Marlin-repacked, and the full raw
-        # is freed once the host cache covers every layer (baseline host
-        # staging: raw on CPU, GPU keeps 1 prepared slot).
+        # Staging buffers for the cache path: the full-layer raw image is NOT
+        # materialized on GPU; each batch is H2D'd from the host cache,
+        # Marlin-repacked, and the full raw is freed once the host cache covers
+        # every layer (baseline host staging: raw on CPU, GPU keeps 1 prepared
+        # slot).
+        #
+        # Each pipeline range owns its own PAIR.  Two buffers per range are what
+        # makes the H2D of batch i+1 overlap the Marlin repack of batch i; with
+        # one buffer the two strictly serialize (the next copy cannot overwrite
+        # it until the repack has consumed it), which measured 12.6 GiB/s of a
+        # 23.22 GiB/s pinned peak.
+        #
+        # The ranges must not SHARE a pair.  A repack is fenced on the compute
+        # of its own range (it overwrites that range's prepared storage), so
+        # sharing would put `range 1's repack -> staging_free -> range 0's H2D`
+        # in one chain, and the transfer stream would transitively wait out the
+        # whole previous layer's grouped GEMMs -- exactly the serialization the
+        # pipeline exists to remove.  Splitting the batch instead of growing the
+        # pool keeps the staging footprint identical to the 2 x BATCH_EXPERTS it
+        # replaces, which matters: at chunk 16384 the card has 0.65 GiB free
+        # once the slots are resident.
         self._full_raw_freed = False
-        self.raw_staging: Dict[str, torch.Tensor] = {
-            name: torch.empty(
-                (BATCH_EXPERTS, *slot0_raw[name].shape[1:]),
-                dtype=slot0_raw[name].dtype,
-                device=self.device,
-            )
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
-        }
+        # Size staging from the context's frozen shape snapshot, not from the
+        # live slot0_raw tensors: `_allocate_mxfp4_slot_storage` frees the
+        # full-layer raw BEFORE the prepared alloc (the free pays for the
+        # slot), so by manager-construction time those entries are empty
+        # Parameters and their .shape would collapse the staging buffers.
+        shape_map = context._raw_weight_shapes
+        self.staging_buffers: List[Dict[str, torch.Tensor]] = [
+            {
+                name: torch.empty(
+                    (STAGING_EXPERTS, *shape_map[name][0][1:]),
+                    dtype=shape_map[name][1],
+                    device=self.device,
+                )
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            }
+            for _ in range(STAGING_BUFFERS_PER_RANGE * PIPELINE_RANGES)
+        ]
+        # [b] = batch b's H2D is complete (transfer -> postprocess)
+        # [b] = batch b's repack has consumed the buffer (postprocess -> transfer)
+        self._staging_ready_events = tuple(
+            torch.cuda.Event() for _ in self.staging_buffers
+        )
+        self._staging_free_events = tuple(
+            torch.cuda.Event() for _ in self.staging_buffers
+        )
+        # A buffer's first use has no prior consumer to wait for; every later
+        # use must wait for the repack that read the previous occupant.
+        self._staging_use_count = [0] * len(self.staging_buffers)
+        # range_consumed[r] fences the compute of range r on the main stream.
+        # The next layer's repack of range r waits on it, which is what lets
+        # repack(L+1, r) run under compute(L, r) without touching range r's
+        # buffer early.  `_range_consumed_valid[r]` is False until the first
+        # compute records one (and is reset by abort_round).
+        self._range_consumed = [torch.cuda.Event() for _ in range(PIPELINE_RANGES)]
+        self._range_consumed_valid = [False] * PIPELINE_RANGES
+        # Sum buffer for the pipeline ranges; see _range_accumulator.
+        self._range_output: Optional[torch.Tensor] = None
+        # See _MXFP4_LAYERWISE_STAGE_DEBUG.
+        self._stage_marks: Optional[tuple] = None
+        self._stage_xfer_start: Optional[torch.cuda.Event] = None
+        self._stage_xfer_end: Optional[torch.cuda.Event] = None
+        self._stage_fence_end: Optional[torch.cuda.Event] = None
+        self._stage_batches: List[torch.cuda.Event] = []
+        self._stage_probe_done = False
+        self._stage_repack_end: Optional[torch.cuda.Event] = None
+        self._stage_last_compute_start: Optional[torch.cuda.Event] = None
+        self._stage_streams_logged = False
 
         self.epoch = -1
         self.last_layer_position: Optional[int] = None
@@ -2098,7 +2432,7 @@ class _Mxfp4LayerwisePrefillManager:
             slot.marlin_prepared = None
         self.slots = ()
         try:
-            self.raw_staging.clear()
+            self.staging_buffers.clear()
         except Exception:
             pass
         self._full_raw_freed = True
@@ -2143,6 +2477,20 @@ class _Mxfp4LayerwisePrefillManager:
         """Tell the caching allocator which prepared tensors compute consumes."""
 
         prepared = slot.marlin_prepared
+        if prepared is None:
+            return
+        if isinstance(prepared, tuple):
+            # Strided triton_kernels form: the elements are triton_kernels.Tensor
+            # wrappers (or PrecisionConfig, which owns no storage), not torch
+            # tensors.  Record whatever underlying storage they expose; nothing to
+            # do for a pure alias, since the raw slot tensors are already recorded.
+            for item in prepared:
+                for attr in ("data", "storage", "base"):
+                    inner = getattr(item, attr, None)
+                    if isinstance(inner, torch.Tensor):
+                        inner.record_stream(stream)
+                        break
+            return
         for tensor in (
             prepared.w13,
             prepared.w13_scale,
@@ -2153,7 +2501,23 @@ class _Mxfp4LayerwisePrefillManager:
 
     def _bind_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         layer = self.context.gpu_layer
-        layer._v4_marlin_weights = slot.marlin_prepared
+        prepared = slot.marlin_prepared
+        if isinstance(prepared, tuple):
+            # Strided triton_kernels form (SGLANG_KT_PREFILL_TK_SLOT=1): zero extra
+            # bytes over the raw slot.  The layer's own dispatch keys on these flags,
+            # so binding the tk objects is all the compute path needs -- see
+            # _allocate_mxfp4_slot_storage for why the Marlin copy is 6.72 GiB.
+            w13_swiz, w13_pcg, w2_swiz, w2_pcg = prepared
+            layer._v4_tk_w13 = w13_swiz
+            layer._v4_tk_w13_pcg = w13_pcg
+            layer._v4_tk_w2 = w2_swiz
+            layer._v4_tk_w2_pcg = w2_pcg
+            layer._v4_tk_intermediate_size = layer.w2_weight.shape[2] * 2
+            layer._v4_tk_num_experts = layer.w13_weight.shape[0]
+            layer._v4_tk_path = True
+            layer._v4_marlin_path = False
+            return
+        layer._v4_marlin_weights = prepared
         layer._v4_marlin_path = True
         layer._v4_tk_path = False
 
@@ -2314,6 +2678,9 @@ class _Mxfp4LayerwisePrefillManager:
             num_experts=self.context.gpu_layer.num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            include_gpu_experts=os.environ.get(
+                "KT_PREFILL_RELEASE_RESIDENTS"
+            ) == "1",
         )
         if layer_cache is None:
             self._host_cache[layer_idx] = None
@@ -2464,14 +2831,21 @@ class _Mxfp4LayerwisePrefillManager:
                     del self.context.original_buffers[name]
             except Exception:
                 pass
-        # Force the ~3.75 GiB raw image out of the CUDA caching allocator's
-        # live set so the first layerwise forward sees the real free pool
-        # (without this the freed raw stays reserved and the production
-        # 24K-chunk forward OOMs where the baseline -- which never allocates
-        # a full-layer raw -- fits).
+        # Force the raw image out of the CUDA caching allocator's live set so
+        # the first layerwise forward sees the real free pool (without this the
+        # freed raw stays reserved and the production 24K-chunk forward OOMs
+        # where the baseline -- which never allocates a full-layer raw -- fits).
+        #
+        # Only when something was actually freed.  With
+        # SGLANG_KT_SLOT_FREE_RAW_FIRST the raw is already gone before this runs,
+        # so the loop above frees 0 bytes -- and empty_cache() here would then
+        # hand the allocator's whole pool back to the driver right before the
+        # server starts serving, making every decode-step allocation a fresh
+        # cudaMalloc.
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if freed_bytes and torch.cuda.is_available():
+            if os.environ.get("SGLANG_KT_NO_EMPTY_CACHE") != "1":
+                torch.cuda.empty_cache()
         logger.debug(
             "[SLOTLOAD] freed full-layer raw (%.2f GiB) after host cache "
             "covered all %d layers; layerwise footprint = prepared %.2f GiB "
@@ -2481,18 +2855,166 @@ class _Mxfp4LayerwisePrefillManager:
             sum(
                 t.numel() * t.element_size()
                 for t in (
-                    self.slots[0].marlin_prepared.w13,
-                    self.slots[0].marlin_prepared.w13_scale,
-                    self.slots[0].marlin_prepared.w2,
-                    self.slots[0].marlin_prepared.w2_scale,
+                    []
+                    if isinstance(self.slots[0].marlin_prepared, tuple)
+                    else [
+                        self.slots[0].marlin_prepared.w13,
+                        self.slots[0].marlin_prepared.w13_scale,
+                        self.slots[0].marlin_prepared.w2,
+                        self.slots[0].marlin_prepared.w2_scale,
+                    ]
                 )
             )
             / 1024**3,
             sum(
-                t.numel() * t.element_size() for t in self.raw_staging.values()
+                t.numel() * t.element_size()
+                for buffer in self.staging_buffers
+                for t in buffer.values()
             )
             / 1024**3,
         )
+
+    def _stage_probe_source(self, slot, layer_cache: Dict[str, torch.Tensor]) -> None:
+        """One-shot: WHICH property of the in-situ copy costs the 25 -> 19.7 GB/s?
+
+        Offline every configuration of this copy reaches 25 GB/s while in situ the same bytes
+        move at 19.7, and the offline arms that came back flat are already long: placement
+        (either single node, or interleave), allocation mode (cudaHostAlloc vs pageable +
+        cudaHostRegister), batch shape, pinned footprint 7-271 GiB, SM load and power draw, the
+        real repack chained on the buffer-free event, competing host-memory traffic, and a
+        memory-bound instead of compute-bound kernel.
+
+        The first version of this probe copied ONE 720 MiB region three times inside the server
+        and read 25.0, which is an upper bound rather than the pipeline's rate: repeating one
+        region keeps its page tables warm, while a layer SWEEPS 7.65 GB once.  So this version
+        measures all three shapes in the same one-shot, in the server's own context:
+
+          1-region x3   -- the warm case, for continuity with that earlier reading
+          sweep         -- every batch of one whole layer into the real staging buffers,
+                           exactly as `_repack_from_cache` issues it, nothing else running
+          sweep+repack  -- the same with the real `prepare_v4_mxfp4_marlin` chained on each
+                           buffer's free event (into a scratch slot, so the live slot is not
+                           clobbered), which is the pipeline's actual structure
+        """
+        if not _MXFP4_LAYERWISE_STAGE_DEBUG or self._stage_probe_done:
+            return
+        self._stage_probe_done = True
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
+            allocate_v4_mxfp4_marlin,
+            prepare_v4_mxfp4_marlin,
+        )
+
+        def timed(issue) -> float:
+            """Seconds the transfer stream spends on `issue`, events on that stream only."""
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(self.transfer_stream)
+            issue()
+            end.record(self.transfer_stream)
+            end.synchronize()
+            return start.elapsed_time(end) / 1e3
+
+        def sweep(with_repack: bool):
+            """Issue one layer's worth of batches, the way `_repack_from_cache` does."""
+            scratch = (
+                allocate_v4_mxfp4_marlin(
+                    num_experts=STAGING_EXPERTS,
+                    hidden_size=slot.marlin_prepared.hidden_size,
+                    intermediate_size=slot.marlin_prepared.intermediate_size,
+                    device=self.device,
+                )
+                if with_repack
+                else None
+            )
+            free = [torch.cuda.Event(), torch.cuda.Event()]
+            ready = [torch.cuda.Event(), torch.cuda.Event()]
+            used = [False, False]
+
+            def issue() -> None:
+                for index, start in enumerate(
+                    range(0, slot.num_experts, STAGING_EXPERTS)
+                ):
+                    count = min(STAGING_EXPERTS, slot.num_experts - start)
+                    buf = index % STAGING_BUFFERS_PER_RANGE
+                    staging = self.staging_buffers[buf]
+                    with torch.cuda.stream(self.transfer_stream):
+                        if with_repack and used[buf]:
+                            self.transfer_stream.wait_event(free[buf])
+                        for name in _Mxfp4PrefillSlot.RAW_NAMES:
+                            staging[name][:count].copy_(
+                                layer_cache[name][start : start + count],
+                                non_blocking=True,
+                            )
+                        ready[buf].record(self.transfer_stream)
+                    if with_repack:
+                        with torch.cuda.stream(self.postprocess_stream):
+                            self.postprocess_stream.wait_event(ready[buf])
+                            prepare_v4_mxfp4_marlin(
+                                staging["w13_weight"][:count],
+                                staging["w13_weight_scale_inv"][:count],
+                                staging["w2_weight"][:count],
+                                staging["w2_weight_scale_inv"][:count],
+                                out=V4MarlinPreparedWeights(
+                                    w13=scratch.w13[:count],
+                                    w13_scale=scratch.w13_scale[:count],
+                                    w2=scratch.w2[:count],
+                                    w2_scale=scratch.w2_scale[:count],
+                                    hidden_size=scratch.hidden_size,
+                                    intermediate_size=scratch.intermediate_size,
+                                    num_experts=count,
+                                ),
+                            )
+                            free[buf].record(self.postprocess_stream)
+                            used[buf] = True
+
+            return issue, scratch
+
+        try:
+            reps = 3
+            source = layer_cache["w13_weight"][:STAGING_EXPERTS]
+            warm_bytes = source.numel() * source.element_size() * reps
+            warm_dev = torch.empty_like(source, device=self.device)
+
+            def issue_warm() -> None:
+                # The stream context is load-bearing: `copy_` outside it lands on the
+                # current stream, and the events recorded on the transfer stream would
+                # then bracket nothing (measured once as a nonsense 11170 GB/s).
+                with torch.cuda.stream(self.transfer_stream):
+                    for _ in range(reps):
+                        warm_dev.copy_(source, non_blocking=True)
+
+            warm = timed(issue_warm)
+            del warm_dev
+
+            sweep_bytes = sum(
+                layer_cache[name].numel() * layer_cache[name].element_size()
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            )
+            # Three plain sweeps then one chained: the first pass over a layer's pages is
+            # the cold one, and the pipeline is a steady-state (repeated) reader, so the
+            # SEQUENCE is what says whether 19 GB/s is cold-start or the real rate.
+            sweeps = []
+            for _ in range(3):
+                issue, scratch = sweep(with_repack=False)
+                sweeps.append(sweep_bytes / timed(issue) / 1e9)
+                del issue, scratch
+            issue, scratch = sweep(with_repack=True)
+            chained = sweep_bytes / timed(issue) / 1e9
+            del issue, scratch
+
+            logger.info(
+                "[lwprobe] GB/s  1-region x%d=%.2f  sweeps=%s  sweep+repack=%.2f   "
+                "(%.2f GiB per sweep, staging %d experts)",
+                reps,
+                warm_bytes / warm / 1e9,
+                "/".join(f"{s:.2f}" for s in sweeps),
+                chained,
+                sweep_bytes / 1024**3,
+                STAGING_EXPERTS,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostic only, never break prefill
+            logger.warning("[lwprobe] failed: %s", exc)
 
     def _repack_from_cache(
         self,
@@ -2500,60 +3022,311 @@ class _Mxfp4LayerwisePrefillManager:
         method,
         original_layer: torch.nn.Module,
         layer_cache: Dict[str, torch.Tensor],
-        cpu_expert_ids: List[int],
         gpu_expert_ids: List[int],
+        first_expert: int,
+        num_experts: int,
+        ready_event: torch.cuda.Event,
+        previous_compute_fence: Optional[torch.cuda.Event],
+        range_index: int,
     ) -> None:
-        """H2D the host cache in batches and Marlin-repack into the prepared
-        slot, WITHOUT materializing the full layer raw on GPU.
+        """H2D one expert range of the host cache and Marlin-repack it into the
+        prepared slot, WITHOUT materializing the full layer raw on GPU.
 
         For the all-CPU placement each batch is a contiguous slice of the
         cache (one bulk H2D per weight per batch); mixed GPU/CPU placements
-        fall back to per-expert copies inside the batch.  Must be called with
-        the transfer stream current.  Repack completion is published on the
-        slot ready event (this replaces _postprocess_slot on the cache path).
+        fall back to per-expert copies inside the batch.
+
+        The H2D runs on the transfer stream and the Marlin repack on the
+        postprocess stream, with this range's own pair of staging buffers
+        alternating per batch, so the copy of batch i+1 overlaps the repack of
+        batch i.  Serializing the two on one stream is what held the link at 54%
+        of peak (see the staging_buffers note in __init__).
+
+        `previous_compute_fence` is the fence the PREVIOUS reader of this
+        range's prepared storage recorded on the compute stream -- the range's
+        own grouped GEMM one layer earlier (see PIPELINE_RANGES).  It fences
+        the repack only, not the H2D before it, which is the whole point: the
+        bytes for the next range keep crossing the link while the current range
+        is still being computed.  Completion is published on `ready_event` from
+        the postprocess stream; consumers wait on that, not on the transfer
+        stream.
+
+        `range_index` selects the staging pair.  It must not be shared between
+        ranges: the H2D's wait for a freed staging buffer would then chain
+        through the other range's repack and, with it, that range's compute
+        fence -- putting the PCIe link back behind the grouped GEMMs.
         """
         from sglang.srt.layers.quantization.v4_marlin_moe import (
             prepare_v4_mxfp4_marlin,
         )
 
-        num_experts = slot.num_experts
-        all_cpu = not gpu_expert_ids
-        with torch.cuda.stream(self.transfer_stream):
-            for start in range(0, num_experts, BATCH_EXPERTS):
-                count = min(BATCH_EXPERTS, num_experts - start)
+        range_gpu_expert_ids = [
+            e
+            for e in gpu_expert_ids
+            if first_expert <= e < first_expert + num_experts
+        ]
+        # A released resident raw (KT_PREFILL_RELEASE_RESIDENTS) has no GPU copy
+        # to read, so the range must come from the host cache like any CPU
+        # expert -- which is why the cache is built over ALL experts when that
+        # release is active.  Without this the mixed branch below dereferences
+        # `None[gpu_index]` and the whole prefill dies in
+        # "MXFP4 cache repack for layer 0 failed".
+        _resident_raw = getattr(original_layer, "w13_weight", None)
+        all_cpu = (not range_gpu_expert_ids) or _resident_raw is None
+        last_expert = first_expert + num_experts
+        starts = list(range(first_expert, last_expert, STAGING_EXPERTS))
+        buffer_base = range_index * STAGING_BUFFERS_PER_RANGE
+        if first_expert == 0:
+            self._stage_xfer_start = self._stage_mark(self.transfer_stream)
+            self._stage_probe_source(slot, layer_cache)
+        if previous_compute_fence is not None:
+            with torch.cuda.stream(self.postprocess_stream):
+                self.postprocess_stream.wait_event(previous_compute_fence)
+            if first_expert == 0:
+                # When the last reader of this range's prepared storage finished, as a
+                # position in the transfer stream's timeline.  `fence` > `xfer` in the
+                # stage report means the repack -- and with it every H2D past the first
+                # pair of staging buffers -- was gated by the PREVIOUS layer's GEMM, so
+                # the link was idle for that much of the span.
+                self._stage_fence_end = self._stage_mark(self.postprocess_stream)
+        for index, start in enumerate(starts):
+            count = min(STAGING_EXPERTS, last_expert - start)
+            buf = buffer_base + index % STAGING_BUFFERS_PER_RANGE
+            staging = self.staging_buffers[buf]
+            with torch.cuda.stream(self.transfer_stream):
+                if _MXFP4_LAYERWISE_STAGE_DEBUG and first_expert == 0:
+                    # Paired with the mark below: their difference is the batch's COPY
+                    # time, and the gap from the previous pair is the time the transfer
+                    # stream spent waiting.  `busy` vs `xfer` separates "the copies are
+                    # slow here" from "the link idles".
+                    self._stage_batches.append(self._stage_mark(self.transfer_stream))
+                if self._staging_use_count[buf] > 0:
+                    # This buffer's previous repack must have consumed it.
+                    self.transfer_stream.wait_event(self._staging_free_events[buf])
                 if all_cpu:
                     for name in _Mxfp4PrefillSlot.RAW_NAMES:
-                        self.raw_staging[name][:count].copy_(
+                        staging[name][:count].copy_(
                             layer_cache[name][start : start + count],
                             non_blocking=True,
                         )
                 else:
+                    # `bool(method.gpu_experts_mask[expert_id])` inside the loop below is a
+                    # synchronizing DtoH, so staging one layer cost 384 of them.  Read the mask
+                    # once; read the index map lazily, so an all-CPU mask (--kt-num-gpu-experts 0)
+                    # pays no extra readback at all.
+                    mask_host = method.gpu_experts_mask.cpu().tolist()
+                    gpu_index_host = None
                     for i in range(count):
                         expert_id = start + i
-                        if bool(method.gpu_experts_mask[expert_id]):
-                            gpu_index = (
-                                method.logical_to_gpu_index[expert_id].item()
-                            )
+                        if mask_host[expert_id]:
+                            if gpu_index_host is None:
+                                gpu_index_host = (
+                                    method.logical_to_gpu_index.cpu().tolist()
+                                )
+                            gpu_index = gpu_index_host[expert_id]
                             for name in _Mxfp4PrefillSlot.RAW_NAMES:
-                                self.raw_staging[name][i].copy_(
+                                staging[name][i].copy_(
                                     getattr(original_layer, name)[gpu_index],
                                     non_blocking=True,
                                 )
                         else:
                             for name in _Mxfp4PrefillSlot.RAW_NAMES:
-                                self.raw_staging[name][i].copy_(
+                                staging[name][i].copy_(
                                     layer_cache[name][expert_id],
                                     non_blocking=True,
                                 )
+                self._staging_ready_events[buf].record(self.transfer_stream)
+                if _MXFP4_LAYERWISE_STAGE_DEBUG and first_expert == 0:
+                    self._stage_batches.append(self._stage_mark(self.transfer_stream))
+            with torch.cuda.stream(self.postprocess_stream):
+                self.postprocess_stream.wait_event(self._staging_ready_events[buf])
                 prepare_v4_mxfp4_marlin(
-                    self.raw_staging["w13_weight"][:count],
-                    self.raw_staging["w13_weight_scale_inv"][:count],
-                    self.raw_staging["w2_weight"][:count],
-                    self.raw_staging["w2_weight_scale_inv"][:count],
+                    staging["w13_weight"][:count],
+                    staging["w13_weight_scale_inv"][:count],
+                    staging["w2_weight"][:count],
+                    staging["w2_weight_scale_inv"][:count],
                     out=self._prepared_range_view(slot, start, count),
                 )
-            slot.ready_event.record(self.transfer_stream)
-            slot.reuse_guard = "ready"
+                self._staging_free_events[buf].record(self.postprocess_stream)
+                self._staging_use_count[buf] += 1
+        if last_expert >= slot.num_experts:
+            # End of the transfer stream's work for the whole layer: recorded
+            # after the last batch's copies, so the span excludes the Marlin
+            # repack (which runs on the postprocess stream).
+            self._stage_xfer_end = self._stage_mark(self.transfer_stream)
+        ready_event.record(self.postprocess_stream)
+        if last_expert >= slot.num_experts:
+            # Trailing Marlin repack of the layer, on the postprocess stream.
+            # A dedicated timing event: `ready_event` is a plain fence and
+            # cudaEventElapsedTime rejects mixing the two kinds.
+            self._stage_repack_end = self._stage_mark(self.postprocess_stream)
+        slot.reuse_guard = "ready"
+
+    def _stage_mark(self, stream) -> Optional[torch.cuda.Event]:
+        """Record a timing boundary for SGLANG_LAYERWISE_STAGE_DEBUG, else None."""
+        if not _MXFP4_LAYERWISE_STAGE_DEBUG:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    def _stage_report_previous(self) -> None:
+        """Log the previous layer's device-stage spans.
+
+        Deferred to the next layer and skipped unless every event has completed,
+        so the report never synchronizes the pipeline it is measuring.  Whether
+        the transfer stream and the compute stream actually overlap is exactly
+        the question this answers, so it must not be answered by a probe that
+        serializes them.
+        """
+        global _MXFP4_LAYERWISE_STAGE_LEFT
+        prev = self._stage_marks
+        fence_end = self._stage_fence_end
+        batch_marks = self._stage_batches
+        if prev is None:
+            return
+        self._stage_marks = None
+        self._stage_fence_end = None
+        self._stage_batches = []
+        if not _MXFP4_LAYERWISE_STAGE_DEBUG or _MXFP4_LAYERWISE_STAGE_LEFT <= 0:
+            return
+        prev_layer, xfer_start, xfer_end, repack_end, compute_start, compute_end = prev
+        marks = (xfer_start, xfer_end, repack_end, compute_start, compute_end)
+        if any(m is None or not m.query() for m in marks):
+            return
+        _MXFP4_LAYERWISE_STAGE_LEFT -= 1
+        period = (
+            self._stage_last_compute_start.elapsed_time(compute_start)
+            if self._stage_last_compute_start is not None
+            else float("nan")
+        )
+        self._stage_last_compute_start = compute_start
+        fence = (
+            xfer_start.elapsed_time(fence_end)
+            if fence_end is not None and fence_end.query()
+            else float("nan")
+        )
+        # Per-batch pairs: (start, end) per H2D batch.  `busy` is the sum of the copy
+        # spans and `stall` the sum of the waits between them, so `busy` against `xfer`
+        # says whether the link is slow or idle.
+        busy = stall = max_gap = float("nan")
+        if (
+            batch_marks
+            and len(batch_marks) % 2 == 0
+            and xfer_start is not None
+            and all(m is not None and m.query() for m in batch_marks)
+        ):
+            busy = 0.0
+            stall = xfer_start.elapsed_time(batch_marks[0])
+            max_gap = stall
+            for index in range(0, len(batch_marks), 2):
+                busy += batch_marks[index].elapsed_time(batch_marks[index + 1])
+                if index + 2 < len(batch_marks):
+                    gap = batch_marks[index + 1].elapsed_time(batch_marks[index + 2])
+                    stall += gap
+                    max_gap = max(max_gap, gap)
+        logger.info(
+            "[lwstage] layer=%d xfer=%.1fms busy=%.1fms stall=%.1fms maxgap=%.1fms "
+            "fence=%.1fms repack_tail=%.1fms compute=%.1fms period=%.1fms",
+            prev_layer,
+            xfer_start.elapsed_time(xfer_end),
+            busy,
+            stall,
+            max_gap,
+            fence,
+            xfer_end.elapsed_time(repack_end),
+            compute_start.elapsed_time(compute_end),
+            period,
+        )
+
+    def _stage_note_streams(self, main_stream) -> None:
+        """Log the stream ids once: a side stream that PyTorch created as a
+        *blocking* stream would be implicitly ordered against the default
+        stream, which would make the transfer/compute overlap impossible no
+        matter how the events are wired."""
+        if self._stage_streams_logged:
+            return
+        self._stage_streams_logged = True
+        logger.info(
+            "[lwstage] main stream=%d transfer=%d postprocess=%d "
+            "(default=%d, non_blocking flags transfer=%s postprocess=%s)",
+            main_stream.cuda_stream,
+            self.transfer_stream.cuda_stream,
+            self.postprocess_stream.cuda_stream,
+            torch.cuda.default_stream(self.device).cuda_stream,
+            getattr(self.transfer_stream, "is_non_blocking", "n/a"),
+            getattr(self.postprocess_stream, "is_non_blocking", "n/a"),
+        )
+
+    def _range_accumulator(self, chunk: torch.Tensor) -> torch.Tensor:
+        """A stable [m, k] buffer summing the pipeline ranges' partial outputs.
+
+        Every range shares ONE Marlin workspace -- the ranges have the same
+        `num_experts`, so the same workspace key -- hence one `output` view that
+        each grouped GEMM overwrites.  The accumulation therefore needs a buffer
+        of its own.  It is cached so a layer's extra footprint is exactly one
+        hidden-state-sized tensor instead of a fresh allocation per layer: the
+        card has well under a GiB free once the layerwise slot is resident at
+        chunk 16384 (measured 0.65 GiB).
+        """
+        buf = self._range_output
+        if (
+            buf is None
+            or buf.shape != chunk.shape
+            or buf.dtype != chunk.dtype
+            or buf.device != chunk.device
+        ):
+            buf = torch.empty_like(chunk)
+            self._range_output = buf
+        return buf
+
+    def _pipeline_ranges_for(self, num_experts: int) -> List[tuple]:
+        """The expert ranges one layer is split into for the transfer/compute
+        overlap, as [start, count) pairs covering [0, num_experts).
+
+        The last range absorbs the remainder so the split always covers every
+        expert even when num_experts is not a multiple of PIPELINE_RANGES.
+        """
+        base = num_experts // PIPELINE_RANGES
+        ranges = []
+        start = 0
+        for index in range(PIPELINE_RANGES):
+            count = base if index < PIPELINE_RANGES - 1 else num_experts - start
+            ranges.append((start, count))
+            start += count
+        return ranges
+
+    def _range_fence(
+        self, range_index: Optional[int], slot: _Mxfp4PrefillSlot
+    ) -> Optional[torch.cuda.Event]:
+        """The compute fence this range's prepared storage is protected by.
+
+        Normally the previous layer's compute of the same range, recorded on the
+        main stream mid-layer so that the repack can still overlap the previous
+        range's GEMM.  Before the first compute of a round there is no per-range
+        fence yet, so fall back to the layer-level consumed event, which is
+        strictly stronger (it covers the whole previous layer).  `None` means
+        the single-range (SHM) path, which has no per-range state.
+        """
+        if range_index is None:
+            return slot.consumed_event if slot.has_consumed_event else None
+        if self._range_consumed_valid[range_index]:
+            return self._range_consumed[range_index]
+        return slot.consumed_event if slot.has_consumed_event else None
+
+    def _consume_range(
+        self,
+        slot: _Mxfp4PrefillSlot,
+        range_index: Optional[int],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Record that this range's grouped GEMM has been enqueued on `stream`."""
+        if range_index is not None:
+            self._range_consumed[range_index].record(stream)
+            self._range_consumed_valid[range_index] = True
+            return
+        slot.consumed_event.record(stream)
+        slot.has_consumed_event = True
 
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
@@ -2567,13 +3340,20 @@ class _Mxfp4LayerwisePrefillManager:
                 # Repack and scale-swizzle into stable caller-owned storage.  The
                 # kernel is current-stream ordered and publishes no events; the
                 # layerwise scheduler owns the raw/ready/consumed lifecycle.
-                prepare_v4_mxfp4_marlin(
-                    slot.w13_weight,
-                    slot.w13_weight_scale_inv,
-                    slot.w2_weight,
-                    slot.w2_weight_scale_inv,
-                    out=slot.marlin_prepared,
-                )
+                #
+                # Under SGLANG_KT_PREFILL_TK_SLOT=1 the prepared object is a strided
+                # ALIAS of this slot's raw tensors, so the host-written raw IS the
+                # compute input and the repack has nothing to write.  That is the
+                # point of the mode: it drops the 6.72 GiB prepared copy (and the
+                # per-layer repack) to make room for resident GPU experts.
+                if not isinstance(slot.marlin_prepared, tuple):
+                    prepare_v4_mxfp4_marlin(
+                        slot.w13_weight,
+                        slot.w13_weight_scale_inv,
+                        slot.w2_weight,
+                        slot.w2_weight_scale_inv,
+                        out=slot.marlin_prepared,
+                    )
             finally:
                 # Even an exceptional conversion attempt must publish a fence
                 # before this slot can be overwritten on a retry.
@@ -2639,8 +3419,13 @@ class _Mxfp4LayerwisePrefillManager:
                 ]
                 gpu_expert_ids = []
                 cpu_expert_ids = []
+                # This runs once per layer in the layerwise prefill, so the per-expert
+                # `.item()` loop it replaces cost 384 synchronizing DtoH per layer (15360 per
+                # chunk) -- all of them wasted at --kt-num-gpu-experts 0, where the mask is
+                # all-False.  One readback, same values.
+                mask_host = method.gpu_experts_mask.cpu().tolist()
                 for expert_id in range(slot.num_experts):
-                    if method.gpu_experts_mask[expert_id].item():
+                    if mask_host[expert_id]:
                         gpu_expert_ids.append(expert_id)
                     else:
                         cpu_expert_ids.append(expert_id)
@@ -2670,8 +3455,9 @@ class _Mxfp4LayerwisePrefillManager:
                             self.transfer_stream.wait_event(slot.ready_event)
                         elif reuse_guard == "raw":
                             self.transfer_stream.wait_event(slot.raw_ready_event)
+                        gpu_index_host = method.logical_to_gpu_index.cpu().tolist()
                         for expert_id in gpu_expert_ids:
-                            gpu_index = method.logical_to_gpu_index[expert_id].item()
+                            gpu_index = gpu_index_host[expert_id]
                             for name, _, destination in weight_infos:
                                 source = getattr(original_layer, name)
                                 destination[expert_id].copy_(
@@ -2689,23 +3475,45 @@ class _Mxfp4LayerwisePrefillManager:
                 # is already packed in host memory; repack straight into the
                 # prepared slot through the small staging buffer (no full-layer
                 # raw on GPU, no KT write, no per-expert sync, no SHM
-                # collective).  The transfer stream dependencies (reuse guard)
-                # were established above by the GPU copy block when the SHM
-                # path is taken; for the cache path _repack_from_cache issues
-                # the waits itself.
+                # collective).  Each range waits on the compute fence of its own
+                # storage, which _repack_from_cache applies to the repack rather
+                # than to the H2D -- that is what lets the next range's bytes
+                # cross the link while the current one is being computed.
+                #
+                # Only range 0 is issued here.  The later ranges are issued from
+                # apply(), after the earlier ranges' grouped GEMMs are enqueued,
+                # because that is the only place where the range's compute fence
+                # for THIS layer is known (they must not be repacked before the
+                # previous layer's compute of the same range has drained).
+                slot.pipeline_ranges = self._pipeline_ranges_for(slot.num_experts)
+                slot.layer_cache = layer_cache
+                slot.range_gpu_expert_ids = gpu_expert_ids
                 try:
+                    first_start, first_count = slot.pipeline_ranges[0]
                     self._repack_from_cache(
                         slot,
                         method,
                         original_layer,
                         layer_cache,
-                        cpu_expert_ids,
                         gpu_expert_ids,
+                        first_start,
+                        first_count,
+                        slot.range_ready_event[0],
+                        self._range_fence(0, slot),
+                        0,
                     )
                     self._maybe_free_full_raw()
                 except Exception as exc:
                     pending_h2d_error = exc
             else:
+                # SHM path: no host cache for this layer, so there is no repack
+                # to overlap and the whole layer is a single range.  Clearing the
+                # cache-path state is load-bearing: apply() reads it to decide
+                # whether to pipeline, and a stale value from the previous
+                # layer's cache-path load would send it down the pipeline.
+                slot.pipeline_ranges = None
+                slot.layer_cache = None
+                slot.range_gpu_expert_ids = []
                 for position, expert_id in enumerate(cpu_expert_ids):
                     host_slot = position % 2
 
@@ -2915,8 +3723,35 @@ class _Mxfp4LayerwisePrefillManager:
             return
         self._load_slot(target, successor_idx, next_method, next_layer)
 
+    def _log_mem_debug(self, label: str, layer_idx: int) -> None:
+        """Log this rank's allocator state around a layerwise apply.
+
+        Only meaningful on TP0 (the other ranks would just repeat it), and only
+        for the first `_MXFP4_LAYERWISE_MEM_DEBUG_LEFT` applies of the process,
+        which is the window that covers the steady-state per-batch working set.
+        """
+        global _MXFP4_LAYERWISE_MEM_DEBUG_LEFT
+        if not _MXFP4_LAYERWISE_MEM_DEBUG or _MXFP4_LAYERWISE_MEM_DEBUG_LEFT <= 0:
+            return
+        _MXFP4_LAYERWISE_MEM_DEBUG_LEFT -= 1
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        logger.info(
+            "[lwmem] %s layer=%d free=%.2f GiB alloc=%.2f reserved=%.2f "
+            "peak_alloc=%.2f peak_reserved=%.2f (total=%.2f GiB)",
+            label,
+            layer_idx,
+            free_bytes / 1024**3,
+            torch.cuda.memory_allocated() / 1024**3,
+            torch.cuda.memory_reserved() / 1024**3,
+            torch.cuda.max_memory_allocated() / 1024**3,
+            torch.cuda.max_memory_reserved() / 1024**3,
+            total_bytes / 1024**3,
+        )
+
     def apply(self, method, layer, dispatch_output):
         layer_idx = method.kt_config.layer_idx
+        self._stage_report_previous()
+        self._log_mem_debug("pre-acquire", layer_idx)
         slot, prefetch_hit = self._acquire(layer_idx, method, layer)
         if slot.layer_idx != layer_idx or slot.epoch != self.epoch:
             raise RuntimeError(
@@ -2930,7 +3765,7 @@ class _Mxfp4LayerwisePrefillManager:
         compute_error = None
         try:
             main_stream = torch.cuda.current_stream(self.device)
-            main_stream.wait_event(slot.ready_event)
+            self._stage_note_streams(main_stream)
             self._bind_slot(slot)
             self._record_prepared_backing_on_stream(slot, main_stream)
             # Compute DIRECTLY with apply_v4_marlin_moe (baseline host-staging
@@ -2947,6 +3782,7 @@ class _Mxfp4LayerwisePrefillManager:
             from sglang.srt.layers.moe.topk import TopKOutputChecker
             from sglang.srt.layers.quantization.v4_marlin_moe import (
                 apply_v4_marlin_moe,
+                build_compacted_routing,
             )
 
             topk_output = dispatch_output.topk_output
@@ -2961,17 +3797,91 @@ class _Mxfp4LayerwisePrefillManager:
                     "MXFP4 layerwise prefill: unsupported topk format "
                     f"{topk_output.format}"
                 )
-            output = apply_v4_marlin_moe(
-                hidden_states=dispatch_output.hidden_states,
-                prepared=slot.marlin_prepared,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                # DSV4 applies routed_scaling_factor after the experts (the
-                # layerwise path is not a fused-RSF backend), matching the
-                # baseline.
-                routed_scaling_factor=1.0,
-                swiglu_limit=method.moe_runner_config.swiglu_limit,
-            )
+            # One grouped GEMM per pipeline range.  Splitting the layer lets
+            # range i+1's H2D run under range i's GEMM; the ranges are strictly
+            # ordered on the main stream, so the summary is just their sum.  See
+            # PIPELINE_RANGES.  A non-pipelined slot (the SHM path) is one range.
+            ranges = slot.pipeline_ranges or [(0, slot.num_experts)]
+            pipelined = slot.pipeline_ranges is not None
+            _log_pipeline_ranges(ranges)
+            compute_start = self._stage_mark(main_stream)
+            output = None
+            for range_index, (start, count) in enumerate(ranges):
+                if not pipelined:
+                    ready_event = slot.ready_event
+                elif range_index == 0:
+                    # Repacked by _load_slot, before this layer's compute.
+                    ready_event = slot.range_ready_event[0]
+                else:
+                    # Repack on the side streams, fenced on the previous layer's
+                    # GEMM of this same range, so its bytes cross the link now.
+                    self._repack_from_cache(
+                        slot,
+                        method,
+                        layer,
+                        slot.layer_cache,
+                        slot.range_gpu_expert_ids,
+                        start,
+                        count,
+                        slot.range_ready_event[range_index],
+                        self._range_fence(range_index, slot),
+                        range_index,
+                    )
+                    ready_event = slot.range_ready_event[range_index]
+                main_stream.wait_event(ready_event)
+                # A split layer must COMPACT each range's routing.  Without it
+                # `apply_v4_marlin_moe` runs `m * topk` rows per range regardless of how
+                # many experts are in it -- the sanitizer maps the out-of-range ids to
+                # expert 0 with weight 0 and computes them anyway -- so R ranges cost R x
+                # the row work and the split is a net loss (measured -11% at R=2).  With
+                # compaction each range runs only its own rows (M=16384, R=2: the GEMM goes
+                # 173.7 -> 103.8 ms, 1.816x -> 1.086x dense), which is what lets the H2D
+                # hide under the GEMM.
+                compact = (
+                    build_compacted_routing(topk_ids, topk_weights, start, count)
+                    if pipelined and len(ranges) > 1
+                    else None
+                )
+                chunk = apply_v4_marlin_moe(
+                    hidden_states=dispatch_output.hidden_states,
+                    prepared=self._prepared_range_view(slot, start, count),
+                    topk_weights=topk_weights,
+                    # The kernel's sanitizer zeroes the weight of every id
+                    # outside [0, count), so shifting by `start` is what
+                    # restricts this GEMM to its own range of experts.
+                    topk_ids=(topk_ids - start) if start else topk_ids,
+                    # DSV4 applies routed_scaling_factor after the experts (the
+                    # layerwise path is not a fused-RSF backend), matching the
+                    # baseline.
+                    routed_scaling_factor=1.0,
+                    swiglu_limit=method.moe_runner_config.swiglu_limit,
+                    compact=compact,
+                )
+                self._consume_range(
+                    slot, range_index if pipelined else None, main_stream
+                )
+                if output is None:
+                    if len(ranges) > 1:
+                        output = self._range_accumulator(chunk)
+                        output.copy_(chunk)
+                    else:
+                        output = chunk
+                else:
+                    output.add_(chunk)
+            if _MXFP4_LAYERWISE_STAGE_DEBUG:
+                self._stage_marks = (
+                    layer_idx,
+                    self._stage_xfer_start,
+                    self._stage_xfer_end,
+                    self._stage_repack_end,
+                    compute_start,
+                    self._stage_mark(main_stream),
+                )
+            if pipelined:
+                # Keep the layer-level fence meaningful: it now means "every
+                # range of this layer is repacked".  The per-range events are
+                # what the compute actually waits on.
+                slot.ready_event.record(self.postprocess_stream)
             # Debug (2026-08-18): env-gated per-layer output dump for the
             # layerwise-vs-non-layerwise divergence root cause. Saves the MoE
             # apply input/routing/output (bf16, [num_tokens, hidden]) per layer.
@@ -3025,6 +3935,7 @@ class _Mxfp4LayerwisePrefillManager:
         # GPU compute is now enqueued.  Host KT writes and successor transfer
         # scheduling can overlap it without requiring an async kt-kernel API.
         self._prefetch_successor(slot)
+        self._log_mem_debug("post-prefetch", layer_idx)
         if method.tp_rank == 0:
             logger.debug(
                 "KT MXFP4 layerwise prefill: layer=%d epoch=%d slot=%d %s",
@@ -3091,6 +4002,7 @@ def _build_mxfp4_host_cache_entry(
     num_experts: Optional[int] = None,
     hidden_size: Optional[int] = None,
     intermediate_size: Optional[int] = None,
+    include_gpu_experts: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Pack every CPU expert of a layer into a host cache tensor dict.
 
@@ -3128,7 +4040,7 @@ def _build_mxfp4_host_cache_entry(
     cpu_ids = [
         e
         for e in range(num_experts)
-        if not bool(method.gpu_experts_mask[e])
+        if include_gpu_experts or not bool(method.gpu_experts_mask[e])
     ]
     if not cpu_ids:
         return None
@@ -3239,6 +4151,54 @@ def _build_mxfp4_host_cache_entry(
     return layer_cache
 
 
+def _release_mxfp4_host_cache(signature: tuple) -> int:
+    """Drop the eager pinned host weight cache for a signature; return bytes freed.
+
+    SGLANG_KT_RELEASE_HOST_CACHE=1 calls this right before the layerwise slot
+    allocation.  The cache is the layerwise prefill's transfer SOURCE and the
+    largest host-side object the run creates (~316 GB for 40 layers, pinned and
+    unreclaimable), and with the slot live it is the prime suspect in the
+    +40 ms decode step that appears exactly when the slot is resident: a page
+    cache of that size on a box already holding the 193 GB engram tables makes
+    every allocator/device op pay page-table and reclaim pressure that has
+    nothing to do with the attention/MoE math.  libnuma also reports the
+    interleave as costing throughput on a single-node-bound scheduler.
+
+    Dropping it costs one re-pack of 0.9 s/layer on the FIRST layerwise prefill
+    (the per-batch packing path still works; `_mxfp4_eager_cache_worker`
+    rebuilds it too), which is a one-time price against a per-step one.
+    """
+    if os.environ.get("SGLANG_KT_RELEASE_HOST_CACHE") != "1":
+        return 0
+    freed = 0
+    with _MXFP4_EAGER_CACHE_LOCK:
+        layers = _MXFP4_EAGER_HOST_CACHE.pop(signature, {}) or {}
+    for layer_cache in layers.values():
+        if not layer_cache:
+            continue
+        for tensor in layer_cache.values():
+            nbytes = tensor.numel() * tensor.element_size()
+            try:
+                torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+            except Exception:
+                pass
+            freed += nbytes
+        # Pinned pages are unreclaimable until the tensors die; break the refs
+        # here (and the manager's own per-layer copies below) so the host
+        # allocator actually gets them back.
+        layer_cache.clear()
+    _KT_HOST_CACHE_RELEASED.add(signature)
+    print(
+        "[host-free] released pinned host weight cache %.2f GiB (%d layers)"
+        % (freed / 1024**3, len(layers)),
+        flush=True,
+    )
+    return freed
+
+
+_KT_HOST_CACHE_RELEASED: set = set()
+
+
 def _mxfp4_eager_cache_worker(signature: tuple) -> None:
     """Build every registered layer's pinned host cache in the background.
 
@@ -3251,7 +4211,11 @@ def _mxfp4_eager_cache_worker(signature: tuple) -> None:
     if not order:
         return
     built = 0
-    num_cpu = 0
+    num_cached = 0
+    # With KT_PREFILL_RELEASE_RESIDENTS the residents' GPU raw is gone for the
+    # whole session, so the layerwise repack has to source them from this cache
+    # too (see _repack_from_cache).
+    include_gpu_experts = os.environ.get("KT_PREFILL_RELEASE_RESIDENTS") == "1"
     for layer_idx in order:
         entry = registry.get(layer_idx)
         if entry is None:
@@ -3260,26 +4224,53 @@ def _mxfp4_eager_cache_worker(signature: tuple) -> None:
         if not _mxfp4_pipeline_requested(method) or method.tp_rank != 0:
             continue
         cache = _build_mxfp4_host_cache_entry(
-            method, layer_idx, pinned=True
+            method,
+            layer_idx,
+            pinned=True,
+            include_gpu_experts=include_gpu_experts,
         )
         with _MXFP4_EAGER_CACHE_LOCK:
             _MXFP4_EAGER_HOST_CACHE.setdefault(signature, {})[layer_idx] = cache
         if cache is not None:
             built += 1
-            num_cpu = len(
+            # The cached row count, i.e. the same predicate the builder uses --
+            # reporting the mask's complement instead understated it by every
+            # resident expert whenever include_gpu_experts was on.
+            num_cached = len(
                 [
                     e
                     for e in range(method.global_num_experts)
-                    if not bool(method.gpu_experts_mask[e])
+                    if include_gpu_experts
+                    or not bool(method.gpu_experts_mask[e])
                 ]
             )
-    logger.debug(
+    # info, not debug: a layer that failed cudaHostRegister returns None and is
+    # dropped from `built`, so this count is the only startup evidence that the
+    # in-place pin actually took. Runs once, so the line is cheap.
+    logger.info(
         "[SLOTLOAD] eager host-weight cache build done: %d/%d layers "
-        "(%d CPU experts each, pinned).",
+        "(%d experts cached each, pinned).",
         built,
         len(order),
-        num_cpu,
+        num_cached,
     )
+    # The host side is now covered for every layer, which is the precondition
+    # for the layerwise slots to be worth materializing -- and this is the last
+    # moment before traffic where VRAM is not yet holding a batch's working
+    # memory.  Do it on this thread so the GPU allocator is touched from one
+    # place.  See maybe_init_mxfp4_layerwise_slots.
+    #
+    # Wait for the KV pool first: that allocation is what the slot footprint
+    # must not be charged against.  Sizing the pool with the slots already live
+    # pushes the required --mem-fraction-static from 0.46 to 0.857 (measured
+    # 2026-09-22), because the draft model's load, which runs after this worker
+    # starts, measures its own `mem usage` as a delta of process memory and
+    # therefore absorbs whatever the slots took.
+    if _MXFP4_MEMORY_POOL_READY.wait(timeout=900):
+        try:
+            maybe_init_mxfp4_layerwise_slots()
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            logger.warning("[SLOTLOAD] eager layerwise slot init failed: %s", exc)
 
 
 def maybe_start_mxfp4_host_cache_build() -> None:
@@ -3322,7 +4313,7 @@ def _mxfp4_eager_cache_worker_all(signatures: list) -> None:
 
 
 def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
-    device = next(layer.parameters()).device
+    device = _layer_device(layer)
     return (
         str(device),
         method.kt_config.weight_path,
@@ -3339,6 +4330,126 @@ def _mxfp4_pipeline_requested(method) -> bool:
     )
 
 
+_MXFP4_MEMORY_POOL_READY = threading.Event()
+
+
+def mark_mxfp4_memory_pool_ready() -> None:
+    """Tell the eager layerwise-slot builder that the KV pool is allocated.
+
+    The slot footprint must be charged to whatever is left after the pool, not
+    counted as model weights.  See `maybe_init_mxfp4_layerwise_slots` for the
+    measured reason (the pool-sizing floor goes 0.46 -> 0.857 otherwise).
+    """
+    _MXFP4_MEMORY_POOL_READY.set()
+
+
+def maybe_init_mxfp4_layerwise_slots() -> None:
+    """Materialize the layerwise GPU slots while VRAM is still free.
+
+    The slots are allocated lazily today -- from inside the first
+    threshold-qualified prefill forward (see
+    ``_get_or_initialize_mxfp4_layerwise_manager``, whose caller is the apply
+    path).  By then the batch's own working memory is live and the free-VRAM
+    reading is at its session minimum, so on a tight config the allocation
+    misses by a few percent and the pipeline is disabled for the session: the
+    triggering request silently falls through to the hybrid CPU/GPU MoE path,
+    and GPU layerwise prefill never runs at all.  Measured 2026-09-22 on
+    V4.1/SM89 (--mem-fraction-static 0.55): the first attempt needed 4.22 GiB
+    against 4.17 GiB free, on a box that had 15.76 GB free right after pool
+    allocation, and the retry loop then flip-flopped disabled/enabled once per
+    batch, ~4x slower than plain AMX.
+
+    Nothing about the allocation depends on a request, so do it here instead.
+    Same registry walk and same guard as the eager host-cache build, and one
+    manager per signature because a manager owns every layer of its signature.
+
+    Best-effort by construction: a failure lands in the same
+    ``_MXFP4_LAYERWISE_DISABLED_REASONS`` map the lazy path uses, so the first
+    request then behaves exactly as it does today.
+    """
+    if not torch.cuda.is_available():
+        return
+    # Only the largest registry gets slots.  Draft/MTP stages register under a
+    # separate signature (their `weight_key_prefix`/`_registry_prefix` slip past
+    # `_register_mxfp4_prefill_layer`'s filter, which is meant to exclude them)
+    # and they only ever see a 6-token decode-proposal batch, so they can never
+    # reach a threshold-qualified prefill and their slots are pure waste --
+    # measured 2026-09-22: the 3-layer MTP signature took 4.88 GiB and that is
+    # what pushed the box from 8.10 GiB free to 3.42 GiB free and into a CUDA
+    # OOM on the first prefill (`Tried to allocate 1024 MiB, 77 MiB free`).
+    # They keep the lazy path, so a threshold-qualified batch on one of them
+    # still initializes on demand.
+    if not _MXFP4_PREFILL_LAYER_REGISTRY:
+        return
+    target_signature = max(
+        _MXFP4_PREFILL_LAYER_REGISTRY, key=lambda s: len(_MXFP4_PREFILL_LAYER_REGISTRY[s])
+    )
+    for signature, registry in list(_MXFP4_PREFILL_LAYER_REGISTRY.items()):
+        if signature != target_signature:
+            logger.info(
+                "[SLOTLOAD] skipping eager layerwise slots for the %d-layer "
+                "signature (draft/MTP stage; lazy path retained).",
+                len(registry),
+            )
+            continue
+        if (
+            not registry
+            or signature in _MXFP4_LAYERWISE_MANAGERS
+            or signature in _MXFP4_LAYERWISE_DISABLED_REASONS
+        ):
+            continue
+        for layer_idx in sorted(registry):
+            method, layer = registry[layer_idx]
+            if not _mxfp4_pipeline_requested(method) or method.tp_rank != 0:
+                continue
+            if not _mxfp4_pipeline_runtime_supported(method, layer):
+                continue
+            try:
+                manager = _get_or_initialize_mxfp4_layerwise_manager(method, layer)
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                # An exception here means init got PAST the OOM handling (which
+                # already records a disabled reason) and raised -- e.g. the
+                # manager-setup IndexError.  Leaving the signature live let the
+                # FIRST threshold prefill re-run init and raise again, this
+                # time fatal inside forward.  Disable instead so every later
+                # request takes the hybrid path.
+                logger.warning(
+                    "[SLOTLOAD] eager layerwise slot init raised: %s; "
+                    "disabling the layerwise pipeline for this signature",
+                    exc,
+                )
+                _disable_mxfp4_layerwise_pipeline(
+                    signature, f"eager init raised: {exc}"
+                )
+                break
+            if manager is not None:
+                # The host cache covers every layer (this runs at the end of the
+                # eager build), which is exactly the precondition
+                # _maybe_free_full_raw checks, and it is what frees the ~7.91 GiB
+                # full-layer raw image.  Dropping it here is what makes the
+                # layerwise footprint fit: raw(7.91) + prepared(6.72) = 14.63 GiB
+                # against 17.18 GiB left after the 14.29 GiB of model weights
+                # leaves no room for a prefill chunk's activations, while
+                # prepared alone (6.72) does.
+                #
+                # It has to happen here rather than on the first layerwise
+                # forward (where apply() calls it today): by then the batch's
+                # working memory is live, so the free reading is at its session
+                # minimum and the allocation that the freed raw would have paid
+                # for has already failed.
+                manager._maybe_free_full_raw()
+                logger.info(
+                    "[SLOTLOAD] layerwise GPU slots materialized at startup "
+                    "(%d layers on signature), %.2f GiB free after "
+                    "(full-layer raw image released).",
+                    len(registry),
+                    torch.cuda.mem_get_info()[0] / 1024**3,
+                )
+            # One manager per signature either way; `break` also covers the
+            # disabled-reason case, where retrying every layer is pointless.
+            break
+
+
 def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     if not _mxfp4_pipeline_requested(method) or not torch.cuda.is_available():
         return False
@@ -3348,7 +4459,7 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     # uses the prepared Marlin backend on Ada and Blackwell consumer GPUs.
     if os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") in ("0", "1"):
         return False
-    device = next(layer.parameters()).device
+    device = _layer_device(layer)
     return torch.cuda.get_device_capability(device) in ((8, 9), (12, 0))
 
 
@@ -3549,6 +4660,93 @@ def _try_mxfp4_initialization(factory):
         return None, ("fatal", f"{type(exc).__name__}: {exc}")
 
 
+# KT_PREFILL_RELEASE_RESIDENTS=1: the registered layers' raw slices are gone -- released
+# at LOAD by `mxfp4_deepseek.process_weights_after_loading` (so a large N fits the load
+# at all), and again at slot-allocation time by `_release_resident_marlin_copies`.  The
+# full-GPU prefill fallback must therefore never take its Phase 1 D2D shortcut for them.
+# Seeded from the env rather than only set by the hook: the raw is gone from load onward,
+# so the flag has to be in effect for every prefill, including one that runs before slot
+# allocation or when the slot is never allocated at all.
+_KT_RESIDENTS_RAW_RELEASED = os.environ.get("KT_PREFILL_RELEASE_RESIDENTS") == "1"
+
+
+def _release_resident_marlin_copies(signature: tuple) -> None:
+    global _KT_RESIDENTS_RAW_RELEASED
+    """KT_PREFILL_RELEASE_RESIDENTS=1: report the residents' raw release.
+
+    The raw slice is normally already gone by now -- `mxfp4_deepseek` releases it at
+    LOAD under this same env, which is what lets a large N fit the load at all.  This
+    hook is the idempotent backstop and the measurement point.
+
+    The falsification test for the one claim the prefill-scoped release design rests
+    on (see PREFILL_RELEASE_RESIDENTS.md): a release made AFTER the KV/static pool has
+    been sized is not absorbed, unlike every load-time release measured so far -- the
+    tk-slot's 6.72 GiB, pinning the raw slice's 2.65 GiB and a 0 GiB control all
+    landed on the identical "13.44 MiB free".  This runs at slot-allocation time,
+    which IS after the pool sizing (the pool is built in kv_cache_configurator, before
+    the SLOTLOAD lines), and prints the free memory either side of the drop so the
+    claim is decided rather than assumed.
+
+    The RAW slice is what goes, leaving the Marlin copy that decode reads.  The
+    fallback's Phase 1 is the raw's only reader, and `_KT_RESIDENTS_RAW_RELEASED`
+    (seeded from this same env) sends it down the all-CPU arm instead.
+
+    An earlier version of this hook sat in `_Mxfp4LayerwisePrefillManager.apply`, which
+    is circular -- that path only runs once the slot exists, and the slot is exactly
+    what fails to allocate without the release.
+    """
+    if os.environ.get("KT_PREFILL_RELEASE_RESIDENTS") != "1":
+        return
+    free_before = torch.cuda.mem_get_info()[0] / 1024**3
+    alloc_before = torch.cuda.memory_allocated() / 1024**3
+    dropped = 0
+    registry = _MXFP4_PREFILL_LAYER_REGISTRY.get(signature, {})
+    for _layer_idx, entry in registry.items():
+        if entry is None:
+            continue
+        _method, layer = entry
+        prep = getattr(layer, "_v4_marlin_weights", None)
+        if prep is None or isinstance(prep, tuple):
+            continue
+        # ONLY the raw slice is released; the Marlin copy stays.  Decode reads
+        # `_v4_marlin_weights` and never the raw, so decode is unaffected by this --
+        # which is what makes the change a plain load-time one with NO phase scoping
+        # and NO rebuild.  The raw is 2.65 GiB at N=3 against the 0.9 GiB the slot was
+        # short after the Marlin copies alone were released, and Phase 1 of the
+        # full-GPU prefill fallback is its only reader, so
+        # `_KT_RESIDENTS_RAW_RELEASED` sends every expert down the CPU-staging path
+        # instead (the `original_layer=None` arm of `_prepare_weight_fp8`, i.e. "all
+        # experts from CPU"; the KT host pool holds all 384).
+        for _name in _Mxfp4PrefillSlot.RAW_NAMES:
+            _raw_t = getattr(layer, _name, None)
+            if _raw_t is not None:
+                dropped += _raw_t.numel() * _raw_t.element_size()
+                setattr(layer, _name, None)
+    _KT_RESIDENTS_RAW_RELEASED = True
+    gc.collect()
+    # The flush is what hands these 2.47 GiB back to the driver instead of the
+    # caching allocator, so the slot (and every decode step after it) has to
+    # grow a fresh pool rather than reuse these blocks.  Gated so the two
+    # behaviours can be compared in one session.
+    if os.environ.get("SGLANG_KT_NO_EMPTY_CACHE") != "1":
+        torch.cuda.empty_cache()
+    free_after = torch.cuda.mem_get_info()[0] / 1024**3
+    alloc_after = torch.cuda.memory_allocated() / 1024**3
+    print(
+        "[prefill-free] layers=%d dropped=%.2f GiB  alloc %.3f -> %.3f GiB  "
+        "free %.3f -> %.3f GiB"
+        % (
+            len(registry),
+            dropped / 1024**3,
+            alloc_before,
+            alloc_after,
+            free_before,
+            free_after,
+        ),
+        flush=True,
+    )
+
+
 def _allocate_mxfp4_slot_storage(context: SharedFullContext):
     from sglang.srt.layers.quantization.v4_marlin_moe import (
         allocate_v4_mxfp4_marlin,
@@ -3563,10 +4761,95 @@ def _allocate_mxfp4_slot_storage(context: SharedFullContext):
     # pool on the 32GB card, forcing CPU MoE prefill. Single-slot (~3.2GB)
     # mirrors the local arch's lazy 1-prepared design: the successor prefetch
     # is disabled but the layerwise prefill footprint fits.
-    num_experts = slot0_raw["w13_weight"].shape[0]
-    hidden_size = slot0_raw["w13_weight"].shape[2] * 2
-    intermediate_size = slot0_raw["w2_weight"].shape[2] * 2
-    device = slot0_raw["w13_weight"].device
+    # Sizes/device come from the frozen snapshot, not the live tensors: the
+    # Marlin path below frees the full-layer raw, and an OOM retry re-enters
+    # this function with empty Attributes -- reading shape[0] off those would
+    # allocate a 0-expert slot.
+    _w13_shape, _, device = context._raw_weight_shapes["w13_weight"]
+    _w2_shape = context._raw_weight_shapes["w2_weight"][0]
+    num_experts = _w13_shape[0]
+    hidden_size = _w13_shape[2] * 2
+    intermediate_size = _w2_shape[2] * 2
+
+    if os.environ.get("SGLANG_KT_PREFILL_TK_SLOT") == "1":
+        # The prepared Marlin copy is a byte PERMUTATION -- four tensors, 4.22 + 2.11
+        # + 0.27 + 0.14 = 6.72 GiB for a full 384-expert layer -- whereas the
+        # triton_kernels form is a STRIDED ALIAS of the same raw tensors (zero extra
+        # bytes).  That is the same asymmetry that makes decode's resident slice cost
+        # 1.85x in Marlin and 1.00x on the triton path.  Measured 2026-09-23, the
+        # layerwise machinery's 7.91 (raw) + 6.72 (prepared) GiB is what leaves only
+        # 2.55 GiB of the 31.47 GiB card free, which is why the slot allocation fails
+        # at every (N, mfs) with resident experts -- the free memory was invariant to
+        # both, 6 configurations and 2 code variants.  Handing the slot the strided
+        # form frees those 6.72 GiB and is what lets >=3 resident experts and the
+        # layerwise prefill coexist.
+        from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+            convert_v4_weights_to_triton_kernels,
+        )
+
+        # NOTE the container convention: this returns one entry PER SLOT, and the
+        # caller does `slot_marlin_prepared[0]`, so the tk form must be wrapped in a
+        # 1-tuple to mirror the Marlin `for _ in range(1)` build -- otherwise the
+        # slot receives only w13_swiz and `prepared.w13` fails with
+        # "'Tensor' object has no attribute 'w13'".
+        return None, (
+            convert_v4_weights_to_triton_kernels(
+                slot0_raw["w13_weight"],
+                slot0_raw["w13_weight_scale_inv"],
+                slot0_raw["w2_weight"],
+                slot0_raw["w2_weight_scale_inv"],
+            ),
+        )
+
+    # The full-layer raw (~7.91 GiB at 384 experts, printed by this hook) is
+    # only needed for the shapes captured above and for the post-init fallback,
+    # and the eager host cache already covers every layer.  Its own free point
+    # -- `_maybe_free_full_raw` -- runs only after a SUCCESSFUL manager setup,
+    # i.e. after the very allocation that needs the room: with 3 resident
+    # experts the card had 3.77 GiB free against the slot's 6.74 GiB, so init
+    # failed at every (N, mfs) while residents were untouched.  Free it HERE,
+    # before the prepared alloc: 3.77 + 7.91 >= 6.74, residents intact, no
+    # release, no rebuild.  Dropping the local `.data` refs first is required
+    # or the attribute swap frees 0 bytes (same trap the release probe hit).
+    #
+    # Gated so the default path stays bit-identical: without the env var the
+    # raw survives the attempt exactly as before (and the slot fails the same
+    # way it always did at N>0).  Manager/slot construction must not read the
+    # live tensors either way -- see _Mxfp4PrefillSlot's frozen_shapes.
+    del slot0_raw
+    if os.environ.get("SGLANG_KT_SLOT_FREE_RAW_FIRST") == "1":
+        freed = 0
+        for name in _Mxfp4PrefillSlot.RAW_NAMES:
+            t = getattr(context.gpu_layer, name)
+            freed += t.numel() * t.element_size()
+            setattr(
+                context.gpu_layer,
+                name,
+                torch.nn.Parameter(
+                    torch.empty(0, device=t.device), requires_grad=False
+                ),
+            )
+            context.original_params.pop(name, None)
+            context.original_buffers.pop(name, None)
+        if freed:
+            # gc.collect() drops the last references so the blocks reach the
+            # caching allocator's free list -- but do NOT empty_cache() after
+            # it.  The freed w13_weight block IS the slot's first tensor
+            # (384 x 4608 x 2560 int8 = 4.22 GiB, exactly what
+            # allocate_v4_mxfp4_marlin asks for first), so the slot is served
+            # as a cache hit; handing the blocks back to the driver with
+            # empty_cache() would make the slot a fresh cudaMalloc and leave
+            # the allocator with no pool for the decode steps that follow.
+            gc.collect()
+            if os.environ.get("SGLANG_KT_NO_EMPTY_CACHE") != "1":
+                torch.cuda.empty_cache()
+            print(
+                "[slot-free] released full-layer raw %.2f GiB before prepared alloc"
+                % (freed / 1024**3),
+                flush=True,
+            )
+
+    # Single prepared slot, no extra raw copy. The upstream 2-slot ping-pong
     slot_marlin_prepared = tuple(
         allocate_v4_mxfp4_marlin(
             num_experts=num_experts,
@@ -3620,6 +4903,12 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         return
     if context is None or not getattr(context, "_is_mxfp4_quant", False):
         raise RuntimeError("MXFP4 layerwise prefill built a non-MXFP4 full context")
+
+    # Give the slot the residents' Marlin copies when asked (KT_PREFILL_RELEASE_RESIDENTS=1).
+    # This is the last moment a release can still influence the slot's allocation, and
+    # it is already after the KV pool was sized.
+    _release_mxfp4_host_cache(signature)
+    _release_resident_marlin_copies(signature)
 
     slot_storage, slot_failure = _try_mxfp4_initialization(
         lambda: _allocate_mxfp4_slot_storage(context)
@@ -3695,10 +4984,16 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             tensor.numel() * tensor.element_size()
             for slot in manager.slots
             for tensor in (
-                slot.marlin_prepared.w13,
-                slot.marlin_prepared.w13_scale,
-                slot.marlin_prepared.w2,
-                slot.marlin_prepared.w2_scale,
+                *(
+                    []
+                    if isinstance(slot.marlin_prepared, tuple)
+                    else [
+                        slot.marlin_prepared.w13,
+                        slot.marlin_prepared.w13_scale,
+                        slot.marlin_prepared.w2,
+                        slot.marlin_prepared.w2_scale,
+                    ]
+                ),
             )
         )
         logger.info(
@@ -3987,9 +5282,18 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     tp_rank = get_tensor_model_parallel_rank()
 
     if strategy == "frequency":
-        # Load activation frequency from init_expert_location if it's a .pt file
-        init_loc = server_args.init_expert_location
-        has_activation_freq = init_loc and init_loc.endswith(".pt")
+        # `--kt-expert-frequency-file` is the KT-side input: the profile only
+        # picks which experts stay resident on the GPU, it never remaps ids (see
+        # that flag's help).  Reading the same .pt through
+        # `--init-expert-location` also works but has side effects -- that path
+        # builds an ExpertLocationMetadata from `logical_count`
+        # (`compute_initial_expert_location_metadata` -> `init_by_eplb`) and
+        # turns on the logical->physical remap in select_experts -- so it is only
+        # a fallback here.
+        init_loc = (
+            server_args.kt_expert_frequency_file or server_args.init_expert_location
+        )
+        has_activation_freq = bool(init_loc) and init_loc.endswith(".pt")
 
         if has_activation_freq:
             logger.info("Loading activation frequency from %s", init_loc)
@@ -4206,7 +5510,37 @@ def create_kt_config_from_server_args(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+_REMAP_TABLE_CACHE: dict = {}
+
+
+def _remap_table(
+    gpu_experts_mask: torch.Tensor,
+    logical_to_gpu_index: torch.Tensor,
+) -> torch.Tensor:
+    """``where(mask, gpu_index, -1)`` as a ``[num_experts]`` lookup table, cached.
+
+    Both inputs are per-layer placement constants, so this only has to be rebuilt when
+    one of them is replaced (``data_ptr``) or mutated (``_version``).  The caller's
+    lookup then costs a single gather instead of two gathers plus a ``where``, which
+    matters because it runs once per MoE layer per decode step on a
+    ``[num_tokens, top_k]`` tensor that is tiny -- ``[7, 6]`` at decode, where the
+    dispatch of each op costs far more than its work.
+    """
+    key = (
+        gpu_experts_mask.data_ptr(),
+        gpu_experts_mask._version,
+        logical_to_gpu_index.data_ptr(),
+        logical_to_gpu_index._version,
+    )
+    table = _REMAP_TABLE_CACHE.get(key)
+    if table is None:
+        table = torch.where(gpu_experts_mask, logical_to_gpu_index, -1).contiguous()
+        if len(_REMAP_TABLE_CACHE) > 64:
+            _REMAP_TABLE_CACHE.clear()
+        _REMAP_TABLE_CACHE[key] = table
+    return table
+
+
 def mask_and_remap_expert_ids(
     topk_ids: torch.Tensor,
     gpu_experts_mask: torch.Tensor,
@@ -4214,9 +5548,8 @@ def mask_and_remap_expert_ids(
 ) -> torch.Tensor:
     """Mask CPU expert IDs and remap GPU expert IDs to weight indices.
 
-    This function:
-    1. Sets CPU expert IDs (gpu_experts_mask=False) to -1 so GPU kernel skips them
-    2. Remaps GPU expert IDs to GPU weight indices (0 to num_gpu_experts-1)
+    CPU expert IDs (``gpu_experts_mask=False``) become -1 so the GPU kernel skips them;
+    GPU expert IDs become GPU weight indices (0..num_gpu_experts-1).
 
     Args:
         topk_ids: Tensor of shape [num_tokens, top_k] containing logical expert IDs
@@ -4226,10 +5559,7 @@ def mask_and_remap_expert_ids(
     Returns:
         Remapped topk_ids tensor with GPU indices for GPU experts, -1 for CPU experts
     """
-    is_gpu_expert = gpu_experts_mask[topk_ids]
-    # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
-    remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
-    return remapped_ids
+    return _remap_table(gpu_experts_mask, logical_to_gpu_index)[topk_ids]
 
 
 def select_top_experts_from_batch(
@@ -4662,7 +5992,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
 
         # Move mask and mapping tables to GPU for inference
-        target_device = next(layer.parameters()).device
+        target_device = _layer_device(layer)
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
 
@@ -5091,6 +6421,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _kt_t_after_sync = None
         _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
+        _kt_t_cxx = None  # end of the C++ submit inside _submit_with_staged_input
+        _kt_t_pre_cxx = None  # start of it, so the submit splits into python vs C++
 
         # Check for full GPU fallback. The full-GPU path's _build_full_context →
         # _prepare_weight_{mxfp4,fp8,fp8_channel,bf16,int4} helpers read flat
@@ -5350,9 +6682,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
+                _kt_t_pre_cxx = time.perf_counter() if _kt_timing else None
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
                 )
+                if _kt_t_pre_cxx is not None:
+                    _kt_t_cxx = time.perf_counter()
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -5361,6 +6696,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
         topk_ids = topk_output.topk_ids
+        # Measurement only (KT_ROUTE_HIST): the LOGICAL ids, read before
+        # mask_and_remap_expert_ids rewrites CPU experts to -1.  Placed after
+        # the CPU submit above, so the bincount overlaps the CPU expert math.
+        kt_route_hist_note(
+            self.kt_config.layer_idx,
+            int(self.gpu_experts_mask.numel()),
+            num_tokens,
+            topk_ids,
+        )
+        kt_distinct_note(int(self.gpu_experts_mask.numel()), num_tokens, topk_ids)
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
         )
@@ -5501,12 +6846,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _li = getattr(self.kt_config, 'layer_idx', -1)
             _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
             _step = _cls._kt_layer_step[_li]
+            _sub_cxx_ms = (
+                (_kt_t_cxx - _kt_t_pre_cxx) * 1000.0
+                if _kt_t_cxx is not None and _kt_t_pre_cxx is not None
+                else 0.0
+            )
             if _step <= 16 or _step % 16 == 0:
                 logger.info(
                     "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
-                    "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
-                    "cpu_wait=%.2fms num_tokens=%d",
+                    "sub_py=%.2f sub_cxx=%.2f mask=%.2f gpu=%.2f sync=%.2f "
+                    "merge=%.2f cpu_wait=%.2fms num_tokens=%d",
                     _li, _step, _kt_total_ms, _stage_submit_ms,
+                    _stage_submit_ms - _sub_cxx_ms, _sub_cxx_ms,
                     _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )

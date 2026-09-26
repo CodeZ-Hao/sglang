@@ -47,25 +47,78 @@ def wo_a_bf16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return result
 
 
+_WO_A_BT = 64  # output-row tile over R
+_WO_A_SPLITS = 8  # split-K factor over D
+_WO_A_KTILE = 128  # K step inside one split
+# _wo_a_reduce sums a literal `tl.arange(0, 8)` over the split axis, so the two are coupled.
+assert _WO_A_SPLITS == 8
+
+
 @triton.jit
-def _wo_a_partial(X, W, P, M: tl.constexpr, SX: tl.constexpr):
+def _wo_a_partial(
+    X,
+    W,
+    P,
+    M: tl.constexpr,
+    SX: tl.constexpr,
+    G: tl.constexpr,
+    R: tl.constexpr,
+    D: tl.constexpr,
+    SPLITS: tl.constexpr,
+    KCHUNK: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """One fp32 partial of ``einsum('tgd,grd->tgr')`` for ``M <= 16`` tokens.
+
+    Writes partial ``(SPLITS, M, G, R)`` for :func:`_wo_a_reduce` to sum over the split axis.
+    Every stride is that of a CONTIGUOUS ``(G, R, D)`` weight, so the kernel is shape-generic in
+    ``G`` and ``R`` (the launch derives both from ``weight.shape``); only the K chunking
+    constrains ``D``, to a multiple of ``SPLITS * 128``.  Generalized from the TP4 (2, 1024, 4096)
+    literals so the V4.1-Flash (8, 1024, 4096) shape can use it on SM89 too.
+    """
     tile, group, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     m = tl.arange(0, 16)
-    n = tile * 64 + tl.arange(0, 64)
-    k = split * 512 + tl.arange(0, 128)
-    acc = tl.zeros((16, 64), tl.float32)
-    for i in range(4):
+    n = tile * BT + tl.arange(0, BT)
+    k = split * KCHUNK + tl.arange(0, 128)
+    acc = tl.zeros((16, BT), tl.float32)
+    for i in range(KCHUNK // 128):
         offsets = k + i * 128
         x = tl.load(
-            X + m[:, None] * SX + group * 4096 + offsets[None, :], m[:, None] < M, 0
+            X + m[:, None] * SX + group * D + offsets[None, :], m[:, None] < M, 0
         )
-        w = tl.load(W + (group * 1024 + n[None, :]) * 4096 + offsets[:, None])
+        w = tl.load(W + (group * R + n[None, :]) * D + offsets[:, None])
         acc += tl.dot(x, w)
     tl.store(
-        P + ((split * M + m[:, None]) * 2 + group) * 1024 + n[None, :],
+        P + ((split * M + m[:, None]) * G + group) * R + n[None, :],
         acc,
         m[:, None] < M,
     )
+
+
+def _wo_a_partials(x: torch.Tensor, weight: torch.Tensor, m: int) -> torch.Tensor:
+    """The ``(SPLITS, m, G, R)`` fp32 partial buffer for a contiguous ``(G, R, D)`` weight."""
+    groups, rows, dim = weight.shape
+    assert rows % _WO_A_BT == 0, rows
+    assert dim % (_WO_A_SPLITS * _WO_A_KTILE) == 0, dim
+    partial = torch.empty(
+        (_WO_A_SPLITS, m, groups, rows), dtype=torch.float32, device=x.device
+    )
+    _wo_a_partial[(rows // _WO_A_BT, groups, _WO_A_SPLITS)](
+        x,
+        weight,
+        partial,
+        m,
+        x.stride(0),
+        G=groups,
+        R=rows,
+        D=dim,
+        SPLITS=_WO_A_SPLITS,
+        KCHUNK=dim // _WO_A_SPLITS,
+        BT=_WO_A_BT,
+        num_warps=4,
+        num_stages=3,
+    )
+    return partial
 
 
 @triton.jit
@@ -77,20 +130,20 @@ def _wo_a_reduce(P, Y, E: tl.constexpr):
 
 
 def wo_a_bf16_small_batch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Compute ``einsum('tgd,grd->tgr', x, weight)`` for the TP4 WO-A shape.
+    """Compute ``einsum('tgd,grd->tgr', x, weight)`` for a small token batch.
     Partial sums stay in FP32 until the final BF16, token-major store."""
     m = x.shape[0]
-    assert 2 <= m <= 8 and x.shape[1:] == (2, 4096)
-    assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
+    groups, rows, dim = weight.shape
+    assert 2 <= m <= 16
+    assert x.shape[1:] == (groups, dim)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_cuda and x.device == weight.device
-    assert x.stride(2) == 1 and x.stride(1) == 4096 and x.stride(0) >= 8192
-    result = torch.empty((m, 2, 1024), dtype=x.dtype, device=x.device)
-    partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
-    _wo_a_partial[(16, 2, 8)](
-        x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
-    )
-    _wo_a_reduce[(triton.cdiv(m * 2048, 256),)](partial, result, m * 2048, num_warps=4)
+    assert weight.is_contiguous()
+    assert x.stride(2) == 1 and x.stride(1) == dim and x.stride(0) >= groups * dim
+    result = torch.empty((m, groups, rows), dtype=x.dtype, device=x.device)
+    partial = _wo_a_partials(x, weight, m)
+    total = m * groups * rows
+    _wo_a_reduce[(triton.cdiv(total, 256),)](partial, result, total, num_warps=4)
     return result
 
 
@@ -124,15 +177,15 @@ def _quantize_partial(p):
 
 
 def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
-    """WO-A with BF16 rounding followed by FlashInfer-compatible MXFP8 quantization."""
+    """WO-A with BF16 rounding followed by FlashInfer-compatible MXFP8 quantization.
+
+    The MXFP8 epilogue's scale layout is baked to the TP4 ``(2, 1024, 4096)`` shape, so unlike
+    :func:`wo_a_bf16_small_batch` this stays restricted to it.
+    """
     m = x.shape[0]
-    assert 2 <= m <= 8 and x.shape[1:] == (2, 4096)
+    assert 2 <= m <= 16 and x.shape[1:] == (2, 4096)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
     assert x.is_cuda and x.device == weight.device
     assert x.stride(2) == 1 and x.stride(1) == 4096 and x.stride(0) >= 8192
-    partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
-    _wo_a_partial[(16, 2, 8)](
-        x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
-    )
-    return _quantize_partial(partial)
+    return _quantize_partial(_wo_a_partials(x, weight, m))

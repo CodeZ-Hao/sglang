@@ -269,5 +269,12 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        return s.float()
+        # In place: `s.relu()` and the product would each allocate a fresh [t, H, n] while BOTH are
+        # live alongside the einsum output, so this site peaks at three budget-sized tensors where one
+        # suffices -- and `KT_INDEXER_SCORE_BUDGET_BYTES` sizes that tensor to the whole budget, so it
+        # is 128 MiB at the shipping config and it is the allocation that fails when the prefill has
+        # no margin left (task #46).  `s` is dead after this line and the NPU backend already writes
+        # the same expression this way (`ascend_dsv4_backend.py:757`), so the values are bitwise
+        # unchanged and only the buffers differ.
+        s = s.relu_().mul_(weights.unsqueeze(-1))
+        return s.sum(dim=1).float()

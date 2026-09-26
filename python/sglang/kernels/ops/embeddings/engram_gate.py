@@ -1,5 +1,7 @@
 """Fused FP32 Engram gate with a single final cast to the activation dtype."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -45,6 +47,7 @@ def fused_engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert x.ndim == 3 and kv.ndim == 2
     t, hc, d = x.shape
@@ -57,7 +60,11 @@ def fused_engram_gate(
     assert all(
         a.dtype in (torch.bfloat16, torch.float32) for a in (x, kv, q_weight, k_weight)
     )
-    out = torch.empty_like(x)
+    # The kernel reads `X + row*D + col` and writes `O + row*D + col` within the
+    # same program, so `out=x` is a valid in-place form.  Callers that alias the
+    # input elsewhere must keep the default.
+    if out is None:
+        out = torch.empty_like(x)
     if t:
         _engram_gate_kernel[(t * hc,)](
             x,

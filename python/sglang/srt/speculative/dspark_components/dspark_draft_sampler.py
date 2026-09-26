@@ -121,6 +121,23 @@ class DsparkDraftSampler:
         base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+        import os as _os
+        if (
+            _os.environ.get("SGLANG_DSPARK_CONF_DEBUG") == "1"
+            and not globals().get("_CONFDBG_SAMPLER_DONE")
+        ):
+            globals()["_CONFDBG_SAMPLER_DONE"] = True
+            print(
+                f"CONFDBG sampler: rows={tuple(hidden_states.shape)} "
+                f"query_token_num={self.query_token_num} gamma={self.gamma} "
+                f"sample_from_anchor={self.sample_from_anchor} "
+                f"model_hidden={tuple(model_hidden.shape)} "
+                f"sample_hidden={tuple(sample_hidden.shape)} "
+                f"tap={tuple(confidence_tap.shape)} "
+                f"model_gamma={getattr(self.model, 'gamma', None)} "
+                f"num_stages={getattr(self.model, 'num_stages', None)}",
+                flush=True,
+            )
 
         # Fused greedy fast path: only valid for the greedy (non-sampling) fold.
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall

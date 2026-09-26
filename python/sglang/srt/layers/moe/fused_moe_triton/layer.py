@@ -1081,6 +1081,24 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        # KT resident experts: the GPU layer holds only `num_gpu_experts` slots, and the router
+        # reaches slot `logical_to_gpu_index[L]` for logical expert L (it is built that way in
+        # `kt_ep_wrapper.update_gpu_expert_mappings` and consumed by
+        # `mask_and_remap_expert_ids`).  The loader must therefore follow the SAME map.  Without
+        # this, slots 0..N-1 receive the checkpoint's first N experts while the mask may name
+        # any N experts at all -- `uniform`/`front-loading` happen to keep experts 0..N-1 and so
+        # are accidentally correct, but `frequency`/`random` mis-load EVERY resident, and
+        # `kt_ep_wrapper.py:5896`'s "Used by weight_loader to remap expert_id" described a remap
+        # that was never implemented.
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            _kt_lut = getattr(self.quant_method, "logical_to_gpu_index", None)
+            if _kt_lut is not None and int(self.quant_method.num_gpu_experts) > 0:
+                if not (0 <= expert_id < _kt_lut.numel()):
+                    return
+                expert_id = int(_kt_lut[expert_id])
+                if expert_id < 0:
+                    return
+
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)

@@ -61,9 +61,11 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
+    expand_candidate_block_ids,
     make_candidate_indexer,
     mask_topk_scores,
     published_masks,
+    select_candidate_block_ids,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -289,7 +291,22 @@ def _expand_index_page_table(
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+# The chunk bound is what a VRAM-tight layerwise prefill dies on: with the 6.72 GiB
+# layerwise slot resident the first 32768-token chunk OOM'd on a 1024 MiB alloc
+# (`dsv41_sparse.py:272`, the `relu()` transient) with 249 MiB free, i.e. exactly
+# this constant.  It is pure chunking granularity -- the same math in more, smaller
+# pieces -- so it is env-overridable for tight-VRAM runs; the default is unchanged.
+_DEFAULT_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+
+
+def _indexer_score_budget_bytes() -> int:
+    import os
+
+    return int(
+        os.environ.get(
+            "KT_INDEXER_SCORE_BUDGET_BYTES", _DEFAULT_INDEXER_SCORE_BUDGET_BYTES
+        )
+    )
 
 
 def _every_request_fits() -> bool:
@@ -1764,9 +1781,16 @@ class DeepseekV4AttnBackend(
             else tail.extend_seq_lens_cpu
         )
         # TODO(candidate): goes away once the source publishes its tail rows straight
-        # onto the tail metadata (publish_prefill); until then cut the full masks.
+        # onto the tail metadata (publish_prefill); until then cut the full selection.
         full_masks = self.forward_metadata.candidate_metadata
-        if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
+        if isinstance(full_masks, CandidateMasks) and full_masks.request_blocks:
+            tail_metadata.candidate_metadata = CandidateMasks(
+                request_blocks=[
+                    blocks[blocks.shape[0] - t :]
+                    for blocks, t in zip(full_masks.request_blocks, tail_lens_cpu)
+                ]
+            )
+        elif isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
             tail_metadata.candidate_metadata = CandidateMasks(
                 request_masks=[
                     mask[mask.shape[0] - t :]
@@ -3189,13 +3213,17 @@ class DeepseekV4AttnBackend(
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
-                self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+                self._low_ratio_index_topk_sm90_decode(
+                    layer, x, q_lora, req, pos, forward_batch
+                )
         elif (
             self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
-            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+            self._low_ratio_index_topk_torch(
+                layer, x, q_lora, req, pos, forward_batch
+            )
 
     @staticmethod
     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
@@ -3340,7 +3368,7 @@ class DeepseekV4AttnBackend(
             # the block selection tells unreachable positions apart by -inf
             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
-            step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            step = max(1, _indexer_score_budget_bytes() // (lc * 4))
             masks = [
                 select_candidate_blocks(
                     scores[start : start + step],
@@ -3520,7 +3548,9 @@ class DeepseekV4AttnBackend(
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.
-    def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk_sm90_decode(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3546,8 +3576,84 @@ class DeepseekV4AttnBackend(
         # V4 reserves the replay bound in metadata; visibility stays on device.
         # A capture-time length read would both synchronize and truncate replay.
         lmax = min(metadata.max_compressed_seq_len, self.req_to_token.shape[1] // ratio)
+        # `max_compressed_seq_len` is a CAPACITY -- `page_table.shape[1] *
+        # compressed_page_size` (dsv4/metadata.py:201) -- not the batch's live length, so the
+        # slot gather, the `valid` mask and the kernel grid all run at capacity even when every
+        # request is short: at ratio 2 that is 16384 j-positions per request to cover a few
+        # dozen live ones, which is the whole of this arm's cost.
+        #
+        # The scheduler already publishes each request's length host-side, so the live bound is
+        # free -- no readback, which matters because a readback here would drain the pipeline.
+        # Positions past the live bound were already `valid=False` (slots masked to 0) and are
+        # excluded by `lens`, so dropping them is output-identical; `max(1, ...)` keeps the
+        # all-empty case on the same code path instead of taking the early return, whose
+        # outcome is also all -1.
+        #
+        # The bound must hold under target-verify as well as decode, and it must NOT be gated on
+        # decode: this model runs the 40-layer indexer work in the VERIFY forward (DSPARK drafts
+        # with the MTP head and verifies with the main model), so a `is_decode()` gate would make
+        # the crop inert exactly where the cost is.  Under verify the batch carries
+        # `num_draft` rows per request whose positions run past the committed length, so allow
+        # `rows_per_req` extra compressed positions -- derived from shapes, and only a few
+        # against a capacity of thousands.
+        host_lens = forward_batch.seq_lens_cpu
+        if host_lens is not None and len(host_lens) > 0:
+            rows_per_req = max(1, bs // len(host_lens))
+            lmax = max(1, min(lmax, (int(host_lens.max()) + rows_per_req) // ratio))
+        else:
+            # Neither host length is published on this path -- measured at 1M with
+            # SGLANG_KT_IDX_CROP_DEBUG=1:
+            #   `bs=7 host_lens_none=True seq_lens_sum=None lmax=524422`
+            # so the crop above never fires and the rectangle stays at the page table's CAPACITY.
+            # That is the whole of the 1M context's +24 ms/step: an nsys diff of the 128K and 1M
+            # decode traces shows exactly one kernel growing with the pool,
+            # `_fp4_index_logits_kernel` (0.4025 -> 3.1642 ms/launch, x7.86 for an 8x pool), and it is
+            # cleanly L-bounded (`grid = (B, cdiv(L, BLOCK_L))`) -- so L was the capacity, not the live
+            # length.
+            #
+            # The crop's comment above rules out a readback because one would "drain the pipeline".
+            # That trade is now the wrong way round: this step is ~186 ms and the rectangle is ~22 ms
+            # of it, while one `int` read costs a fraction of a millisecond. So read the batch's live
+            # length ONCE PER FORWARD (not per layer -- the 8 indexer layers share one cached value via
+            # an attribute on the ForwardBatch, which `init_new` recreates each forward), and keep the
+            # capture guard: a length read inside capture would synchronize and truncate replay.
+            # Only `torch` is used here on purpose -- the `is_in_breakable_cuda_graph` helpers are not
+            # in scope in this module (using them raised `NameError` and crashed the first decode
+            # step), and the production decode path is eager anyway.
+            if not torch.cuda.is_current_stream_capturing() and not (
+                envs.SGLANG_DEBUG_INDEXER_FORCE_CAPACITY.get()
+            ):
+                cached = getattr(forward_batch, "_idx_crop_bound", None)
+                if cached is None:
+                    try:
+                        cached = int(forward_batch.seq_lens.max().item()) + max(1, bs)
+                    except Exception:
+                        cached = 0
+                    try:
+                        forward_batch._idx_crop_bound = cached
+                    except Exception:
+                        pass
+                if cached > 0:
+                    lmax = max(1, min(lmax, cached // ratio))
         if lmax == 0:
             return
+        import os as _os
+        if (
+            _os.environ.get("SGLANG_KT_IDX_CROP_DEBUG") == "1"
+            and not globals().get("_IDXCROP_DONE")
+        ):
+            globals()["_IDXCROP_DONE"] = True
+            _hl = forward_batch.seq_lens_cpu
+            print(
+                f"IDXCROP: ratio={ratio} bs={bs} max_compressed_seq_len="
+                f"{metadata.max_compressed_seq_len} req_to_token_w="
+                f"{self.req_to_token.shape[1]} host_lens_none={_hl is None} "
+                f"host_lens_len={None if _hl is None else len(_hl)} "
+                f"host_max={None if _hl is None else int(_hl.max())} "
+                f"seq_lens_sum={getattr(forward_batch, 'seq_lens_sum', None)} "
+                f"lmax={lmax}",
+                flush=True,
+            )
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
         j = torch.arange(lmax, device=pos.device)
@@ -3568,10 +3674,40 @@ class DeepseekV4AttnBackend(
                 topk_blocks=indexer.candidate_topk_blocks,
                 block_size=indexer.candidate_block_size,
             )
-            self.forward_metadata.candidate_metadata = CandidateMasks(mask=mask)
+            blocks = block_lens = None
+            if envs.SGLANG_OPT_SM89_CANDIDATE_PRUNE_SCORE.get():
+                # The same block amax + top-k as `select_candidate_blocks`, republished as
+                # ids so the consumer layers can prune BEFORE they score (task #29).
+                blocks, block_lens = select_candidate_block_ids(
+                    s,
+                    lens,
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                )
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                mask=mask, blocks=blocks, block_lens=block_lens
+            )
         elif indexer.uses_candidates:
             # Published this step by the candidate-source layer's decode pass above.
-            consume = published_masks(self.forward_metadata.candidate_metadata).mask
+            published = published_masks(self.forward_metadata.candidate_metadata)
+            if (
+                envs.SGLANG_OPT_SM89_CANDIDATE_PRUNE_SCORE.get()
+                and published.blocks is not None
+            ):
+                self._candidate_prune_score_topk_decode(
+                    layer,
+                    indexer,
+                    q,
+                    weights,
+                    lens,
+                    req,
+                    lmax,
+                    published,
+                    page_indices,
+                    raw_indices,
+                )
+                return
+            consume = published.mask
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
                 "candidate mask missing for decode"
             )
@@ -3589,9 +3725,78 @@ class DeepseekV4AttnBackend(
         if raw_indices is not None:
             raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
+    def _candidate_prune_score_topk_decode(
+        self,
+        layer,
+        indexer,
+        q,
+        weights,
+        lens,
+        req,
+        lmax,
+        published,
+        page_indices,
+        raw_indices,
+    ) -> None:
+        """Task #29: score ONLY the candidate blocks the source layer published.
+
+        The mask path routes the full-width `s` through the published mask and then takes a
+        top-k over `lmax` columns of which every non-candidate is `-inf`. `fp4_index_logits_decode`
+        is per-column -- `logits[b, j]` depends on `slots[b, j]` and `lens[b]` alone, and is
+        `-inf` past `lens[b]` -- so scoring a compacted table of just the candidate columns
+        returns those columns' exact values, and a top-k over the compacted space selects the
+        same columns. What it saves is the `lmax - block_lens` columns the full-width pass
+        scored and discarded.
+        """
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        block_size = indexer.candidate_block_size
+        blocks, block_lens = published.blocks, published.block_lens
+        rows = lens.shape[0]
+        # One-shot, so a leg that reads no step change can tell "the lever bought nothing" from
+        # "the env never reached this process" -- same style as SGLANG_KT_IDX_CROP_DEBUG above.
+        import os as _os
+        if _os.environ.get("SGLANG_KT_CANDPRUNE_DEBUG") == "1" and not globals().get(
+            "_CANDPRUNE_LOGGED"
+        ):
+            globals()["_CANDPRUNE_LOGGED"] = True
+            print(
+                f"CANDPRUNE: layer={layer.layer_id} rows={rows} lmax={lmax} "
+                f"candidates={blocks.shape[1] * block_size} "
+                f"valid_cols={block_lens.tolist()}",
+                flush=True,
+            )
+        offsets = torch.arange(block_size, device=blocks.device)
+        cand_pos = (blocks[:, :, None] * block_size + offsets).flatten(1)
+        # A pad block's positions land past the row's live range and `block_lens` masks that
+        # column out, so clamping here only keeps the gather in bounds.
+        cand_pos = cand_pos.clamp_max(lmax - 1)
+        cand_slots = (
+            self.req_to_token[req[:, None], cand_pos * ratio].to(torch.int64) // ratio
+        )
+        table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        s = fp4_index_logits_decode(
+            q, weights, cand_slots, block_lens, table, table.shape[1] // 68
+        )
+        width = s.shape[1]
+        k = min(indexer.index_topk, width)
+        idx = s.topk(k, dim=-1, sorted=False).indices
+        idx = mask_topk_scores(s, idx)
+        idx = idx.masked_fill(idx < 0, width)
+        idx = idx.sort(dim=-1).values
+        col = idx.clamp_max(width - 1)
+        reach = idx < block_lens[:, None]
+        page_indices[:rows, :k] = torch.where(
+            reach, cand_slots.gather(1, col), -1
+        ).to(torch.int32)
+        if raw_indices is not None:
+            raw_indices[:rows, :k] = torch.where(reach, cand_pos.gather(1, col), -1).to(
+                torch.int32
+            )
+
     # TODO(candidate): torch prefill still publishes / consumes masks inline; same
     # move as above.
-    def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos, forward_batch) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3609,19 +3814,58 @@ class DeepseekV4AttnBackend(
         topk = indexer.index_topk
         publish = [] if indexer.is_candidate_source else None
         consume = (
-            published_masks(self.forward_metadata.candidate_metadata).request_masks
+            published_masks(self.forward_metadata.candidate_metadata).request_blocks
             if indexer.uses_candidates
             else None
         )
-        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
-            tok = (req == r).nonzero().squeeze(1)
+        # Request grouping comes from the host when the batch publishes it.
+        # `torch.unique_consecutive(req)` synchronizes INTERNALLY just to size its own
+        # output, and in the layerwise prefill pipeline that drain costs ~350 ms per
+        # index layer; the scheduler already knows the grouping and each request's row
+        # count, so no readback is needed for it.  Modes that do not publish host-side
+        # chunk lengths (draft-extend) keep the readback path.
+        host_rows = forward_batch.extend_seq_lens_cpu
+        cropped = host_rows is not None and sum(int(n) for n in host_rows) == req.numel()
+        # The per-request visible length stays DEVICE-derived (`compress_lens` knows
+        # about replay), but is read back once per layer instead of once per request.
+        row_lens = [int(n) for n in host_rows] if cropped else None
+        host_lens = None
+        if cropped:
+            seg_id = torch.repeat_interleave(
+                torch.arange(len(row_lens), device=req.device),
+                torch.tensor(row_lens, device=req.device),
+            )
+            host_lens = (
+                torch.zeros(
+                    len(row_lens), dtype=compress_lens.dtype, device=compress_lens.device
+                )
+                .scatter_reduce_(0, seg_id, compress_lens, reduce="amax")
+                .tolist()
+            )
+
+        def _request_groups():
+            if cropped:
+                start = 0
+                for b, n_rows in enumerate(row_lens):
+                    yield (
+                        b,
+                        torch.arange(start, start + n_rows, device=req.device),
+                        req[start],
+                        int(host_lens[b]),
+                    )
+                    start += n_rows
+                return
+            for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+                tok_dev = (req == r).nonzero().squeeze(1)
+                yield b, tok_dev, r, int(compress_lens[tok_dev].max().item())
+
+        for b, tok, r, lc in _request_groups():
             lens = compress_lens[tok]
-            lc = int(lens.max().item())
             if lc == 0:
-                # Consumers address masks by request position, including empty requests.
+                # Consumers address the selection by request position, including empty requests.
                 if publish is not None:
                     publish.append(
-                        torch.zeros(0, 0, dtype=torch.bool, device=pos.device)
+                        torch.zeros(0, 0, dtype=torch.int64, device=pos.device)
                     )
                 continue
             j = torch.arange(lc, device=pos.device)
@@ -3633,27 +3877,37 @@ class DeepseekV4AttnBackend(
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
             rows_per_chunk = max(
                 1,
-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+                _indexer_score_budget_bytes() // (q.shape[1] * lc * 2),
             )
-            masks = [] if publish is not None else None
+            # Publish the selection as block ids, not as the [rows, lc] mask they expand to:
+            # the candidate width is the constant topk_blocks x block_size, so ids are
+            # O(chunk x topk_blocks) and the mask is O(chunk x lc).
+            block_ids = [] if publish is not None else None
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
                 s = indexer.scores(q[tok_c], index_k, weights[tok_c])
                 s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-                if masks is not None:
-                    masks.append(
-                        select_candidate_blocks(
+                if block_ids is not None:
+                    block_ids.append(
+                        select_candidate_block_ids(
                             s,
-                            lens_c[:, None],
+                            lens_c,
                             topk_blocks=indexer.candidate_topk_blocks,
                             block_size=indexer.candidate_block_size,
-                        )
+                        )[0]
                     )
                 elif consume is not None:
-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                    s = s.masked_fill(
+                        ~expand_candidate_block_ids(
+                            consume[b][rows],
+                            indexer.candidate_block_size,
+                            s.shape[1],
+                        ),
+                        -torch.inf,
+                    )
                 idx = s.topk(k, dim=-1, sorted=False).indices
-                if consume is not None and masks is None:
+                if consume is not None and block_ids is None:
                     idx = mask_topk_scores(s, idx)
                     idx = idx.masked_fill(idx < 0, lc)
                 idx = idx.sort(dim=-1).values
@@ -3663,11 +3917,13 @@ class DeepseekV4AttnBackend(
                 ).to(torch.int32)
                 if raw_indices is not None:
                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
-            if masks is not None:
-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+            if block_ids is not None:
+                publish.append(
+                    torch.cat(block_ids) if len(block_ids) > 1 else block_ids[0]
+                )
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_masks=publish
+                request_blocks=publish
             )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -3830,6 +4086,17 @@ class DeepseekV4AttnBackend(
                 # attention. FlashMLA sparse decode/prefill kernels are
                 # Hopper-only, so sgl_kernel 0.4.5 raises
                 # "Unsupported architecture for sparse decode fwd" here.
+                #
+                # `q` is a fresh tensor built for this call (compute_q), so the
+                # fused kernel may write into it: every program reads q[pid_q]
+                # once and writes out[pid_q].  That removes the 1024 MiB
+                # `empty_like` at num_q=16384, which is the last large
+                # allocation the layerwise prefill dies on.  Kept off for the
+                # draft/verify shapes, where q can alias the model's own buffer.
+                _sm8x_in_place = (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                    and not self.is_dspark_draft
+                )
                 return self._forward_dspark_sm8x_swa(
                     q=q,
                     quant_k_cache=swa_k_cache_raw,
@@ -3840,6 +4107,7 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    in_place=_sm8x_in_place,
                 )
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
@@ -4520,6 +4788,7 @@ class DeepseekV4AttnBackend(
         extra_k_cache: Optional[torch.Tensor] = None,
         extra_indices: Optional[torch.Tensor] = None,
         extra_topk_length: Optional[torch.Tensor] = None,
+        in_place: bool = False,
     ) -> torch.Tensor:
         """Ada/Ampere DSpark SWA over the native packed DSV4 KV cache.
 
@@ -4540,23 +4809,104 @@ class DeepseekV4AttnBackend(
                 fused_sm8x_fp8_attn,
             )
 
-            return fused_sm8x_fp8_attn(
-                q=q,
-                swa_cache=quant_k_cache,
-                swa_indices=indices,
-                swa_topk_lengths=topk_length,
-                swa_page_size=page_size,
-                attn_sink=attn_sink,
-                softmax_scale=self.softmax_scale,
-                extra_cache=extra_k_cache,
-                extra_indices=extra_indices,
-                extra_topk_lengths=extra_topk_length,
-                extra_page_size=(
-                    extra_k_cache.shape[1]
-                    if extra_k_cache is not None and extra_indices is not None
-                    else 0
-                ),
+            extra_ps = (
+                extra_k_cache.shape[1]
+                if extra_k_cache is not None and extra_indices is not None
+                else 0
             )
+            # `in_place` removes the kernel's `out = torch.empty_like(q)` -- 1024
+            # MiB at num_q=16384, which is the last large allocation the
+            # resident-slot prefill dies on ("Tried to allocate 1024.00 MiB ...
+            # 171.44 MiB is free", fused_sm8x_fp8_attn.py:290).  Chunking the
+            # query dimension is the fallback for when even the aliased form
+            # cannot fit; rows are independent, so it is the same math.
+            if in_place:
+                return fused_sm8x_fp8_attn(
+                    q=q,
+                    swa_cache=quant_k_cache,
+                    swa_indices=indices,
+                    swa_topk_lengths=topk_length,
+                    swa_page_size=page_size,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_length,
+                    extra_page_size=extra_ps,
+                    in_place=True,
+                )
+            num_q = q.shape[0]
+            chunk = num_q
+            if num_q > _SM8X_ATTN_CHUNK:
+                try:
+                    _free = torch.cuda.mem_get_info(q.device)[0]
+                except Exception:
+                    _free = 0
+                if _free:
+                    # ~4x the output tile: the kernel holds two 256-dim
+                    # accumulators plus a 32-row score tile.
+                    _bytes_per_row = q.shape[1] * q.shape[-1] * 4
+                    chunk = max(
+                        _SM8X_ATTN_CHUNK,
+                        min(num_q, int(_free // (_bytes_per_row * 4))),
+                    )
+            if chunk >= num_q:
+                return fused_sm8x_fp8_attn(
+                    q=q,
+                    swa_cache=quant_k_cache,
+                    swa_indices=indices,
+                    swa_topk_lengths=topk_length,
+                    swa_page_size=page_size,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_length,
+                    extra_page_size=extra_ps,
+                )
+            outs = []
+            for _start in range(0, num_q, chunk):
+                _end = min(num_q, _start + chunk)
+                outs.append(
+                    fused_sm8x_fp8_attn(
+                        q=q[_start:_end],
+                        swa_cache=quant_k_cache,
+                        swa_indices=(
+                            indices[_start:_end]
+                            if indices.shape[0] == num_q
+                            else indices
+                        ),
+                        swa_topk_lengths=(
+                            topk_length[_start:_end]
+                            if topk_length.shape[0] == num_q
+                            else topk_length
+                        ),
+                        swa_page_size=page_size,
+                        attn_sink=attn_sink,
+                        softmax_scale=self.softmax_scale,
+                        extra_cache=extra_k_cache,
+                        extra_indices=(
+                            None
+                            if extra_indices is None
+                            else (
+                                extra_indices[_start:_end]
+                                if extra_indices.shape[0] == num_q
+                                else extra_indices
+                            )
+                        ),
+                        extra_topk_lengths=(
+                            None
+                            if extra_topk_length is None
+                            else (
+                                extra_topk_length[_start:_end]
+                                if extra_topk_length.shape[0] == num_q
+                                else extra_topk_length
+                            )
+                        ),
+                        extra_page_size=extra_ps,
+                    )
+                )
+            return torch.cat(outs, dim=0)
 
         num_q = indices.shape[0]
         # Chunk over queries so the eagerly dequantized window workspace is

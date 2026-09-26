@@ -1127,6 +1127,15 @@ class Scheduler(
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
 
+        # The MXFP4 layerwise GPU slots are sized against what is left AFTER
+        # the pool; release the eager-slot builder now that the pool is in
+        # place, so the two never compete for the same bytes.
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            mark_mxfp4_memory_pool_ready,
+        )
+
+        mark_mxfp4_memory_pool_ready()
+
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
@@ -4778,6 +4787,24 @@ class Scheduler(
         # empty_cache sync overhead.
         if batch.forward_mode.is_extend() and envs.SGLANG_EMPTY_CACHE_PER_CHUNK.get():
             try:
+                # Release the per-chunk buffer caches FIRST.  They are live
+                # references deliberately held for reuse across layers, so an
+                # `empty_cache` alone cannot hand their memory back -- and a
+                # chunked prefill whose chunks do not share a
+                # `next_power_of_2` bucket needs a SECOND one (the Marlin
+                # workspace is ~1.6 GiB per capacity: intermediate13 960 MiB +
+                # intermediate2 453 MiB + output 168 MiB at capacity 16384).
+                # That doubles the working set, which is what this reclamation
+                # exists to prevent.
+                from sglang.srt.layers.quantization.v4_marlin_moe import (
+                    release_workspace_cache,
+                )
+
+                freed = release_workspace_cache()
+                if freed:
+                    logger.info(
+                        "[per-chunk] released %d GiB of cached MoE workspace", freed
+                    )
                 if torch.cuda.memory_reserved() / (1 << 30) > 30.0:
                     torch.cuda.empty_cache()
             except Exception:
@@ -6084,11 +6111,44 @@ def run_scheduler_process(
         pipe_writer.send(scheduler.get_init_info())
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
+        if envs.SGLANG_DEBUG_CUDA_MEM_DUMP.get() is not None:
+            import torch as _torch
+
+            if _torch.cuda.is_available():
+                # Small ring buffer + python-only stacks: the full 'all' form is too slow to dump
+                # before the SIGKILL, and the per-block segments dump above is the primary evidence.
+                _torch.cuda.memory._record_memory_history(
+                    max_entries=20000, stacks="python"
+                )
         scheduler.run_event_loop()
 
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        if envs.SGLANG_DEBUG_CUDA_MEM_DUMP.get() is not None:
+            try:
+                import json as _json
+
+                import torch as _torch
+
+                if _torch.cuda.is_available():
+                    # Write the cheap, history-free dump FIRST.  Measured: the scheduler is SIGKILLed
+                    # ~20 s after the exception (exit -9) and an interrupted `_dump_snapshot` leaves
+                    # NO file at all, so anything expensive must come after this.  `memory_snapshot`
+                    # lists every block of every segment with its size and state, which is what names
+                    # a large live tensor; `memory_summary` only aggregates.
+                    _dump_path = envs.SGLANG_DEBUG_CUDA_MEM_DUMP.get()
+                    with open(f"{_dump_path}.segments.json", "w") as _f:
+                        _json.dump(_torch.cuda.memory_snapshot(), _f)
+                    logger.error("allocator segments written to %s.segments.json", _dump_path)
+                    _torch.cuda.memory._dump_snapshot(_dump_path)
+                    logger.error("allocator snapshot written to %s", _dump_path)
+                    logger.error(
+                        "CUDA memory summary at the exception:\n%s",
+                        _torch.cuda.memory_summary(abbreviated=False),
+                    )
+            except Exception as dump_err:
+                logger.error(f"CUDA memory dump failed: {dump_err}")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.

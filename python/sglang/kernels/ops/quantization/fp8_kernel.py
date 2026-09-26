@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -970,6 +971,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -997,8 +999,41 @@ def _w8a8_block_fp8_matmul(
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
     n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
+    # Split-K (decode).  At M<=8 this kernel's grid is
+    # cdiv(M,BLOCK_SIZE_M) * cdiv(N,BLOCK_SIZE_N) = cdiv(N,BLOCK_SIZE_N) CTAs of
+    # 4 warps, which looked like the reason the deployed M=6 configs reach only
+    # a few hundred GB/s.  MEASURED 2026-09-22 (bench_splitk.py, L2 flushed,
+    # per-iteration events, fp32-reference checked): split-K does NOT help --
+    # 4096x8192 443 -> 431 GB/s, 8192x1024 356 -> 315, 32768x1024 449 -> 426,
+    # across BN in {32,64,128}, because the extra reduction pass costs more than
+    # the added parallelism buys.  The deployed configs therefore carry no
+    # SPLIT_K and this path stays inert.  The honest cold numbers are 356-449
+    # GB/s of the card's 717 (the earlier "229 GB/s" was a profile-share
+    # estimate; the L2-warm bench reports 480-1740 and is not representative --
+    # the 304 GB expert inventory thrashes L2 every layer).
+    # Kept because it also fixes a real bug on the SM90 path: neither this
+    # kernel nor _w8a8_block_fp8_matmul_hopper offset the store by the split
+    # axis, so every split wrote slice 0 and the reduction came back short by
+    # (1 - 1/SPLIT_K).  The hopper kernel still has that bug.
+    # This program owns the slice [k_begin, k_end) and writes an fp32 partial
+    # that the host reduces.  The stepping below uses the ABSOLUTE k index, so
+    # the per-group scale bookkeeping is unchanged -- only the starting offsets
+    # move.
+    n_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    k_begin = 0
+    k_end = n_k_tiles
+    if SPLIT_K > 1:
+        k_per_split = tl.cdiv(n_k_tiles, SPLIT_K)
+        k_begin = tl.program_id(axis=1) * k_per_split
+        k_end = tl.minimum(k_begin + k_per_split, n_k_tiles)
+        a_ptrs += k_begin * BLOCK_SIZE_K * stride_ak
+        b_ptrs += k_begin * BLOCK_SIZE_K * stride_bk
+        group_adv = k_begin // n_tiles_k_per_group_k
+        As_ptrs += group_adv * stride_As_k
+        Bs_ptrs += group_adv * stride_Bs_k
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(k_begin, k_end):
         if needs_masking:
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
@@ -1025,7 +1060,15 @@ def _w8a8_block_fp8_matmul(
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    # Each split must land in its OWN [M, N] slice of the fp32 partial buffer:
+    # the host reduces over that leading axis.  Without this term every split
+    # writes slice 0, so the reduction comes back short by (1 - 1/SPLIT_K) of
+    # the true value -- caught by the fp32-reference check in
+    # bench_splitk.py (maxerr scaled with SPLIT_K: 2.25 / 4.11 / 13.7).
+    c_split_off = tl.program_id(axis=1) * M * N if SPLIT_K > 1 else 0
+    c_ptrs = (
+        C + c_split_off + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    )
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
@@ -1554,13 +1597,66 @@ def get_w8a8_channelwise_fp8_config(N: int, K: int, M: int) -> Optional[Dict[str
     return configs[min(configs.keys(), key=lambda x: abs(x - M))]
 
 
-def select_w8a8_block_fp8_matmul_kernel(M, N, META):
+@functools.lru_cache(maxsize=1)
+def _fp8_decode_unroll_enabled() -> bool:
+    """SGLANG_OPT_FP8_DECODE_UNROLL, resolved once.
+
+    The import is function-local on purpose: this module lives under `sglang.kernels`, and
+    pulling `sglang.srt` in at module scope would close an import cycle (srt imports kernels).
+    Cached so the selector stays free of per-call Python on the decode hot path.
+    """
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_FP8_DECODE_UNROLL.get()
+
+
+def select_w8a8_block_fp8_matmul_kernel(M, N, K, META):
+    """Decode (M<=8) may take the 4x-K-unrolled kernel; everything else takes the default.
+
+    `_w8a8_block_fp8_matmul_unrolledx4` is otherwise reachable only under `_is_hip` (its own
+    selector picks it when the grid is smaller than the device's core count, which is exactly
+    the decode situation).  It unrolls the K loop 4x with BLOCK_SIZE_K unchanged, and measured
+    cold at the four decode shapes it is bitwise-identical to the default kernel and faster at
+    three of them.  Prefill's M>=16384 keeps the default kernel untouched.
+    """
+    if _use_w8a8_block_fp8_matmul_unrolledx4(M, N, K):
+        return _w8a8_block_fp8_matmul_unrolledx4
     return _w8a8_block_fp8_matmul
+
+
+# Decode (N, K) pairs where the x4-K-unrolled kernel measured SLOWER than the default one, so the
+# unroll must not be selected there.  Measured cold at M=7 THROUGH THE REAL GATE (env off vs on,
+# `torch.equal` exact on every shape, 128 MB L2 flush between iterations):
+#
+#     (32768, 1280) 1.41x   (5120, 2304) 0.94x   (4608, 5120) 1.20x   (1792, 5120) 1.09x
+#
+# (5120, 2304) is the only loser, and it is the SECOND largest of the four GEMM terms (7.861 ms/fwd
+# of their 22.61 in the trace), so excluding it is worth ~+0.5-0.7 ms/step.  No single variable
+# separates it -- it does not lose on grid size (72 and 1024 win, 80 loses), on K (1280 and 5120
+# win, 2304 loses) or on weight bytes (9.2 and 23.6 win, 11.8 loses) -- so the exception is carried
+# explicitly rather than as a fitted threshold that would be noise.  Its JSON tile already asks for
+# num_warps 4, so the loss there is the unroll alone, not the warp override.
+_FP8_DECODE_UNROLL_SLOWER_SHAPES = frozenset({(5120, 2304)})
+
+
+def _use_w8a8_block_fp8_matmul_unrolledx4(M, N, K) -> bool:
+    """Whether this GEMM takes the 4x-K-unrolled kernel.
+
+    The ONE predicate for both users -- the kernel selector and the `num_warps` override in
+    `w8a8_block_fp8_matmul_triton`.  They must agree: the override exists only because the
+    unrolled kernel wants 4 warps where the default wants 8, so applying 4 to a call that keeps
+    the default kernel is a silent regression (138.8 vs 187.0 GB/s at 32768x1280).
+    """
+    return (
+        M <= 8
+        and (N, K) not in _FP8_DECODE_UNROLL_SLOWER_SHAPES
+        and _fp8_decode_unroll_enabled()
+    )
 
 
 if _is_hip:
 
-    def use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
+    def use_w8a8_block_fp8_matmul_unrolledx4(M, N, K, META):
         # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
         # Empirical testing shows the sweet spot lies when it's less than the # of
         # compute units available on the device.
@@ -1569,8 +1665,8 @@ if _is_hip:
         )
         num_workgroups <= get_device_core_count()
 
-    def select_w8a8_block_fp8_matmul_kernel(M, N, META):
-        if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
+    def select_w8a8_block_fp8_matmul_kernel(M, N, K, META):
+        if use_w8a8_block_fp8_matmul_unrolledx4(M, N, K, META):
             return _w8a8_block_fp8_matmul_unrolledx4
         else:
             return _w8a8_block_fp8_matmul
@@ -1661,6 +1757,78 @@ def w8a8_mxfp8_matmul_deepgemm(
     return C
 
 
+_FP8_GEMM_STATS: Dict[Tuple[int, int, int], List[float]] = {}
+_FP8_GEMM_CALLS = 0
+
+
+_FP8_GEMM_TIME: Dict[Tuple[int, int, int], List[float]] = {}
+_FP8_GEMM_TIME_CALLS = 0
+
+
+def _fp8_gemm_time_note(M: int, N: int, K: int, ms: float) -> None:
+    """Accumulated device time per shape, gated by KT_FP8_GEMM_TIMING=1.
+
+    A CUPTI share and an isolated benchmark disagree by 5x on these kernels
+    (47.9% of a 56 ms GPU slice vs 2.22 GB/step at a measured 400 GB/s = 5.6 ms),
+    and the difference decides whether a small-M GEMV is worth writing.  Timing
+    the launched kernel on the device settles it; the per-call synchronise
+    serialises the pipeline, so this leg's step is not a throughput number.
+    `ms_total / number of decode steps` is the per-step answer.
+    """
+    global _FP8_GEMM_TIME_CALLS
+    acc = _FP8_GEMM_TIME.setdefault((M, N, K), [0.0, 0.0])
+    acc[0] += 1
+    acc[1] += ms
+    _FP8_GEMM_TIME_CALLS += 1
+    if _FP8_GEMM_TIME_CALLS % 200 == 0:
+        # `worst` is cut at 12, not 6: decode has EIGHT (M,N,K) keys (four target-verify GEMMs at
+        # M=7 and four draft-verify ones at M=6), so a top-6 list silently drops a third of the
+        # shapes and with them a third of the evidence in a per-shape tile A/B.
+        total = sum(v[1] for v in _FP8_GEMM_TIME.values())
+        dec = {k: v for k, v in _FP8_GEMM_TIME.items() if k[0] <= 8}
+        dec_ms = sum(v[1] for v in dec.values())
+        dec_n = sum(int(v[0]) for v in dec.values())
+        worst = sorted(_FP8_GEMM_TIME.items(), key=lambda kv: -kv[1][1])[:12]
+        parts = " ".join(
+            f"[{m}x{n}x{k}] {v[1] / v[0]:.3f}ms x{int(v[0])}" for (m, n, k), v in worst
+        )
+        print(
+            f"[fp8-gemm-time] calls={_FP8_GEMM_TIME_CALLS} total_ms={total:.1f} "
+            f"decode_ms={dec_ms:.1f} decode_calls={dec_n} {parts}",
+            flush=True,
+        )
+
+
+def _fp8_gemm_note(M: int, N: int, K: int) -> None:
+    """Per-shape launch accounting for this kernel, gated by KT_FP8_GEMM_STATS=1.
+
+    Counts the activation and weight reads once each (fp8 is a byte per element,
+    and the block scales are small enough to ignore).  A tile sweep cannot tell
+    "already at the card's streaming rate" from "still has headroom"; the byte
+    total divided by the GPU slice of a decode step can.
+    """
+    global _FP8_GEMM_CALLS
+    if not os.environ.get("KT_FP8_GEMM_STATS"):
+        return
+    acc = _FP8_GEMM_STATS.setdefault((M, N, K), [0, 0.0])
+    acc[0] += 1
+    acc[1] += (M * K + N * K) / 1e6  # MB per call
+    _FP8_GEMM_CALLS += 1
+    if _FP8_GEMM_CALLS % 2000 == 0:
+        decode = {k: v for k, v in _FP8_GEMM_STATS.items() if k[0] <= 8}
+        worst = sorted(decode.items(), key=lambda kv: -kv[1][1])[:8]
+        parts = " ".join(
+            f"[{m}x{n}x{k}] {v[0]}c {v[1] / v[0]:.2f}MB/c" for (m, n, k), v in worst
+        )
+        print(
+            f"[fp8-gemm] calls={_FP8_GEMM_CALLS} "
+            f"total={sum(v[1] for v in _FP8_GEMM_STATS.values()):.0f}MB "
+            f"decode={sum(v[1] for v in decode.values()):.0f}MB "
+            f"decode_calls={sum(v[0] for v in decode.values())} {parts}",
+            flush=True,
+        )
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1687,6 +1855,7 @@ def w8a8_block_fp8_matmul_triton(
     """
 
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    _fp8_gemm_note(M, N, K)
 
     block_n, block_k = block_size
 
@@ -1707,6 +1876,15 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    if _use_w8a8_block_fp8_matmul_unrolledx4(M, N, K):
+        # The JSON tile is shared with the default kernel, and num_warps=4 is worse for THAT
+        # kernel (138.8 vs 187.0 GB/s at 32768x1280), so the override rides the unroll only --
+        # hence the SAME predicate the selector uses, never a second `M <= 8` that could drift
+        # out of step with it.
+        # Measured with the unroll: w4 beats the shipped w8 by 1.16x there (268.2 vs 231.4) and
+        # by 1.67x at 4608x5120 (211.4 vs 126.6).  A new dict, never a mutation of the JSON one.
+        config = {**config, "num_warps": 4}
+
     # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
     # do not match the single-accumulator kernels bit-for-bit.
     hopper_tuned = get_platform().is_sm90 and (
@@ -1718,9 +1896,18 @@ def w8a8_block_fp8_matmul_triton(
         config = {**config, "num_stages": 1}
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
-        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, K, config)
 
-    split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
+    # `_w8a8_block_fp8_matmul` -- the only kernel CUDA selects outside SM90 --
+    # now accepts SPLIT_K as well.  At the decode shapes its grid is
+    # cdiv(M,BM)*cdiv(N,BN) CTAs of 4 warps, i.e. a few warps per SM on a 76-SM
+    # card, which is why the deployed M=6 configs reach only ~230 GB/s; a
+    # second grid axis splits K and multiplies the CTAs.  The gfx1250 kernel
+    # has no split-K, so drop the key there rather than fail the launch.
+    split_k = config.get("SPLIT_K", 1)
+    if kernel is _w8a8_block_fp8_matmul_gfx1250:
+        split_k = 1
+        config = {k: v for k, v in config.items() if k != "SPLIT_K"}
     if split_k > 1:
         assert split_k & (split_k - 1) == 0
         partials = torch.empty((split_k, M, N), device=A.device, dtype=torch.float32)
@@ -1733,7 +1920,12 @@ def w8a8_block_fp8_matmul_triton(
         blocks = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
-        return (blocks, split_k) if hopper_tuned else (blocks,)
+        return (blocks, split_k) if split_k > 1 else (blocks,)
+
+    _kt_t0 = None
+    if os.environ.get("KT_FP8_GEMM_TIMING"):
+        torch.cuda.synchronize()
+        _kt_t0 = time.perf_counter()
 
     kernel[grid](
         A,
@@ -1759,6 +1951,10 @@ def w8a8_block_fp8_matmul_triton(
         **config,
         needs_masking=needs_masking,
     )
+
+    if _kt_t0 is not None:
+        torch.cuda.synchronize()
+        _fp8_gemm_time_note(M, N, K, (time.perf_counter() - _kt_t0) * 1e3)
 
     if split_k > 1:
         _reduce_block_fp8_split_k[(triton.cdiv(M * N, 256),)](
@@ -2525,3 +2721,153 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Grouped block-fp8 `wo_a` absorb GEMM.
+#
+# `wo_a` is `o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]`, a GROUPED GEMM, and
+# `_w8a8_block_fp8_matmul` above is 2-D only.  That is why the fork's fp8 wo_a
+# path is DeepGEMM's `fp8_einsum` -- and why a checkpoint whose wo_a scales are
+# 32-wide rather than 128 falls all the way back to a bf16 einsum at 2x the
+# weight read.  The checkpoint this tree serves is exactly that case: its
+# `quantization_config` is `weight_block_size [32, 32]` with `scale_fmt ue8m0`,
+# i.e. the SAME layout the four `_w8a8_block_fp8_matmul` config JSONs describe,
+# so the block geometry already matches and only the group axis is missing.
+#
+# ONE launch, `grid = G * cdiv(T, BM) * cdiv(R, BN)`.  Looping the 2-D kernel
+# once per group is not an option: each call would be cdiv(1024, 64) = 16 CTAs
+# against 76 SMs, and 16 launches x 43 calls/layer would be ~690 launches/step
+# of pure launch hole on a step that is already launch bound.
+# ---------------------------------------------------------------------------
+WO_A_GROUPED_BLOCK = 32
+# Measured best at the decode/verify width (T=7) over cold, L2-flushed tiles.
+WO_A_GROUPED_CONFIG = (16, 64, 32, 4, 6)  # BM, BN, BK, num_warps, num_stages
+
+
+@triton.jit
+def _wo_a_grouped_fp8_matmul(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    T,
+    G,
+    R,
+    D,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    BLK: tl.constexpr,
+):
+    """`C[t, g, :] = A[t, g, :] @ B[g, :, :]^T` in block fp8, per group `g`.
+
+    A is TOKEN-major (`[T, G, D]`, the attention output's own layout) so the caller needs no
+    permute.  A group-major variant with a `permute(1, 0, 2).contiguous()` in the wrapper was
+    measured and is SLOWER at every width (T=7 1.09x vs 1.16x, T=16384 0.38x vs 0.43x): the extra
+    copy costs more than the shorter T-stride saves.  Callers must gate this to small T anyway --
+    see `_wo_a_fp8_grouped`'s dispatch -- so the wide-T strided read never happens.
+    """
+    pid = tl.program_id(0)
+    n_blk = tl.cdiv(R, BN)
+    m_blk = tl.cdiv(T, BM)
+    g = pid // (m_blk * n_blk)
+    rem = pid % (m_blk * n_blk)
+    pid_m = rem // n_blk
+    pid_n = rem % n_blk
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    m_mask = offs_m < T
+    a_ptr = A + g * D
+    as_ptr = As + g * (D // BLK)
+    b_ptr = B + g * R * D
+    bs_ptr = Bs + g * (R // BLK) * (D // BLK)
+    c_ptr = C + g * R
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, D, BK):
+        kk = k + offs_k
+        a = tl.load(
+            a_ptr + offs_m[:, None] * (G * D) + kk[None, :],
+            mask=m_mask[:, None],
+            other=0.0,
+        )
+        b = tl.load(b_ptr + offs_n[:, None] * D + kk[None, :])
+        # One block scale covers the whole BK depth, so BK is kept EQUAL to BLK.
+        # The scale multiplies the fp8 dot product rather than its operands:
+        # `tl.dot(a * a_s, tl.trans(b * b_s))` promotes both tiles to fp32 and
+        # silently drops the fp8 tensor-core path -- measured 0.50x that way
+        # against 1.67x with the outer-product form below.
+        a_s = tl.load(
+            as_ptr + offs_m * (G * (D // BLK)) + k // BLK, mask=m_mask, other=0.0
+        )
+        b_s = tl.load(bs_ptr + (offs_n // BLK) * (D // BLK) + k // BLK)
+        acc += (a_s[:, None] * b_s[None, :]) * tl.dot(a, tl.trans(b))
+    tl.store(
+        c_ptr + offs_m[:, None] * (G * R) + offs_n[None, :],
+        acc.to(tl.bfloat16),
+        mask=m_mask[:, None],
+    )
+
+
+def wo_a_fp8_grouped_matmul(
+    o: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Grouped block-fp8 `wo_a`: `[T, G, D] x [G*R, D] -> [T, G, R]`.
+
+    `weight` is the checkpoint's fp8 `[G*R, D]` e4m3 tensor and `weight_scale`
+    its fp32 `[G*R // 32, D // 32]` block scales.  Those are the same operands
+    `_w8a8_block_fp8_matmul` takes, which is the point: on a box where
+    `can_serve_block_fp8_as_mxfp8` is False the fp8 linear path already keeps the
+    weight scale in fp32 (power-of-two values decoded from the checkpoint's
+    ue8m0), so nothing has to be converted here.
+
+    The activation is quantized at the weight's own block width, with the same
+    power-of-two scales `triton_w8a8_block_fp8_linear` uses for `scale_ue8m0`
+    checkpoints.
+    """
+    T, G, D = o.shape
+    assert G == num_groups, f"o has {G} o-groups, expected {num_groups}"
+    assert D % WO_A_GROUPED_BLOCK == 0, (D, WO_A_GROUPED_BLOCK)
+    R = weight.shape[0] // G
+    blk = WO_A_GROUPED_BLOCK
+    bm, bn, bk, warps, stages = WO_A_GROUPED_CONFIG
+    # `b` is loaded unmasked, so the tile must divide R and K exactly.
+    assert R % bn == 0 and D % bk == 0, (R, bn, D, bk)
+    assert weight.shape == (G * R, D), (tuple(weight.shape), (G * R, D))
+    assert weight_scale.dtype == torch.float32, weight_scale.dtype
+    assert tuple(weight_scale.shape) == (triton.cdiv(G * R, blk), D // blk), (
+        tuple(weight_scale.shape),
+        (triton.cdiv(G * R, blk), D // blk),
+    )
+
+    o_2d = o.reshape(T * G, D)
+    if not o_2d.is_contiguous():
+        o_2d = o_2d.contiguous()
+    o_fp8, o_s = sglang_per_token_group_quant_fp8(o_2d, blk, scale_ue8m0=True)
+
+    out = torch.empty((T, G, R), device=o.device, dtype=out_dtype)
+    grid = (G * triton.cdiv(T, bm) * triton.cdiv(R, bn),)
+    _wo_a_grouped_fp8_matmul[grid](
+        o_fp8,
+        o_s,
+        weight,
+        weight_scale.view(G, R // blk, D // blk),
+        out,
+        T,
+        G,
+        R,
+        D,
+        BM=bm,
+        BN=bn,
+        BK=bk,
+        BLK=blk,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out

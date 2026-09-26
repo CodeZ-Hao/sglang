@@ -863,7 +863,14 @@ def accept_draft_tokens(
         sampled = torch.argmax(target_probs / exp_noise, dim=-1)
         if sampling_info.is_any_greedy:
             argmaxed = torch.argmax(target_probs, dim=-1)
-            row_greedy = greedy_mask.view(-1)
+            # Per-request mask against per-(request, draft) operands: without the expand a
+            # batch that mixes greedy rows with sampling rows broadcasts [num_reqs] against
+            # [num_reqs * verify_num_draft_tokens] and raises instead of verifying.
+            row_greedy = (
+                greedy_mask.view(-1, 1)
+                .expand(-1, verify_num_draft_tokens)
+                .reshape(-1)
+            )
             sampled = torch.where(row_greedy, argmaxed, sampled)
         target_predict = sampled.view(
             candidates.shape[0], verify_num_draft_tokens

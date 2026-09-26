@@ -36,7 +36,36 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 from typing import Optional, Tuple
+
+# --- Per-stage HOST time of the GPU-expert MoE, KT_GPU_EXP_TIMING=1 ----------
+# This path is what a `--kt-num-gpu-experts N` placement runs for the resident
+# experts, once per layer per step.  Measured 2026-09-22: with N=10 the wrapper's
+# per-layer `gpu` stage goes 0.01 -> ~1.2 ms while nvidia-smi utilisation stays
+# flat at 35% (baseline) -- i.e. the cost is LAUNCH, not GPU execution, and it
+# eats the ~20 ms of CPU bytes the placement saves.  These marks split that
+# launch cost by stage; they deliberately do NOT synchronize.
+_GPU_EXP_TIME: dict[str, list] = {}
+_GPU_EXP_CALLS = 0
+
+
+def _gpu_exp_mark(stage: str, t0: float) -> float:
+    """Accumulate one stage's host time and print per-call means every 500 calls."""
+    global _GPU_EXP_CALLS
+    t1 = time.perf_counter()
+    acc = _GPU_EXP_TIME.setdefault(stage, [0.0, 0])
+    acc[0] += t1 - t0
+    acc[1] += 1
+    if stage == "gemm2":
+        _GPU_EXP_CALLS += 1
+        if _GPU_EXP_CALLS % 500 == 0:
+            parts = " ".join(
+                f"{k}={v[0] / v[1] * 1e3:7.3f}ms"
+                for k, v in sorted(_GPU_EXP_TIME.items(), key=lambda kv: -kv[1][0])
+            )
+            print(f"[gpu-exp-timing] calls={_GPU_EXP_CALLS} {parts}", flush=True)
+    return t1
 
 import torch
 import triton
@@ -418,9 +447,13 @@ def apply_v4_triton_kernels_moe(
     from triton_kernels.matmul_ogs import matmul_ogs
     from sgl_kernel import silu_and_mul
 
+    _t = time.perf_counter() if os.environ.get("KT_GPU_EXP_TIMING") else 0.0
+
     # Refresh strided-layout patch (cheap idempotent guard) in case apply
     # runs in a process where target_info was re-imported.
     _patch_strided_mxfp()
+    if _t:
+        _t = _gpu_exp_mark("patch", _t)
 
     M, K = hidden_states.shape
     N = intermediate_size
@@ -431,6 +464,8 @@ def apply_v4_triton_kernels_moe(
     routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
         topk_ids, topk_weights, num_experts
     )
+    if _t:
+        _t = _gpu_exp_mark("routing", _t)
 
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
     intermediate1 = matmul_ogs(
@@ -441,6 +476,8 @@ def apply_v4_triton_kernels_moe(
         gather_indx=gather_indx,
         precision_config=w13_pcg,
     )
+    if _t:
+        _t = _gpu_exp_mark("gemm1", _t)
     # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
     # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
     # = [gate, up] order from the checkpoint is preserved.
@@ -456,6 +493,8 @@ def apply_v4_triton_kernels_moe(
         (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
     )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
+    if _t:
+        _t = _gpu_exp_mark("silu", _t)
 
     # gemm2: (M*topk, N) @ w2 → (M, K), with gammas=topk_weights for combine
     output = matmul_ogs(
@@ -467,6 +506,8 @@ def apply_v4_triton_kernels_moe(
         precision_config=w2_pcg,
         gammas=routing_data.gate_scal,
     )
+    if _t:
+        _gpu_exp_mark("gemm2", _t)
 
     # routed_scaling_factor is NOT applied here; the caller
     # (mxfp4_deepseek.apply) handles it to stay consistent with the trtllm

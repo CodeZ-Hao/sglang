@@ -1573,6 +1573,43 @@ class Envs:
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # DEBUG-ONLY: skip the low-ratio indexer's live-length crop in EAGER decode too, i.e. force
+    # `lmax` to the page table's capacity exactly as graph capture does (the crop at
+    # `deepseek_v4_backend.py:3614` is guarded by `not is_current_stream_capturing()`).  This exists
+    # to bisect the breakable decode graph's non-bitwise logits: if eager-at-capacity reproduces the
+    # graph's text, the crop's `lmax` width is the cause.  It is a deliberate correctness/behaviour
+    # hazard and costs ~24 ms/step at 1M, so never ship it on.
+    SGLANG_DEBUG_INDEXER_FORCE_CAPACITY = EnvBool(False)
+    # DEBUG-ONLY, one half of the per-layer hidden-state dump used to localize the breakable decode
+    # graph's non-bitwise logits (task #36).  Set it to a DIRECTORY: every target-verify forward then
+    # writes `hs_step<NNN>.pt`, a list of `(layer_index, tensor)` rows -- one per layer named in
+    # `SGLANG_DEBUG_DECODE_HS_LAYERS`, plus `(-1, post-norm hidden)` and `(-2, input_ids)`.  Rows are
+    # written only when the current stream is NOT capturing, so the dump observes REPLAY values and
+    # never adds nodes to a captured region.  Off by default; it is a debug hook, not a knob.
+    SGLANG_DEBUG_DECODE_HS_DUMP = EnvStr(None)
+    # Comma-separated layer indices to dump alongside the post-norm state.  Empty/unset means only the
+    # post-norm row, which alone says whether the divergence is upstream of the LM head.
+    SGLANG_DEBUG_DECODE_HS_LAYERS = EnvStr(None)
+    # DEBUG-ONLY, set it to a FILE PATH: record CUDA allocator history from the moment the scheduler
+    # event loop starts, and on any scheduler exception write `torch.cuda.memory_summary` to the log
+    # plus an allocator snapshot to that path.  This exists to name WHICH allocation grows with the
+    # PROMPT length during a long layerwise prefill: a chunked prefill's own activations are
+    # chunk-sized, yet the measured memory footprint fits
+    # `106 KB x prompt_tokens + 78 KB x chunk_tokens`, so something is sized by the committed length
+    # and reading the code did not find it.  The snapshot's allocation history carries python stacks,
+    # which is the only thing that names it.  Recording costs memory and time, so never ship it on.
+    SGLANG_DEBUG_CUDA_MEM_DUMP = EnvStr(None)
+    SGLANG_OPT_SM89_HC_FUSE_SMALL = EnvBool(False)
+    # Task #29, clause 3: let the SM89 (Triton, non-DeepGEMM) decode indexer PRUNE BEFORE IT SCORES,
+    # the way the SM100 two-level indexer does.  `make_candidate_indexer` returns None below sm100, so
+    # the SM89 path (`deepseek_v4_backend.py::_low_ratio_index_topk_sm90_decode`) currently scores the
+    # full `lmax` and only then applies the candidate-source layer's mask to the top-k.  With this on,
+    # a consumer layer gathers just the published candidate blocks into a compacted slot table and
+    # scores only those columns.  Numerically constructively identical: the logits kernel is
+    # per-column (`logits[b, j]` depends only on `slots[b, j]` and `lens[b]`, `-inf` past `lens`), so
+    # the surviving columns keep their exact values -- which is what `ut_candidate_prune_exact.py`
+    # proved offline before this was written.  Default off; it is a perf toggle, not a behaviour change.
+    SGLANG_OPT_SM89_CANDIDATE_PRUNE_SCORE = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # cache, GEMM, and distributed
@@ -1581,6 +1618,34 @@ class Envs:
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # SM89 grouped block-fp8 wo_a absorb GEMM.  A checkpoint whose wo_a is e4m3
+    # with 32x32 ue8m0 block scales cannot use the DeepGEMM fp8_einsum path
+    # above (`wo_a_fp8_gemm_enabled` wants 128x128), so the runtime dequantizes
+    # wo_a to bf16 at load: 2x the weight read on a step that is weight-traffic
+    # bound, plus 1.34 GB resident.  The 32x32 layout is the same one
+    # `_w8a8_block_fp8_matmul` already serves for wq_b/wo_b on this box, so a
+    # Triton grouped GEMM over the o-group axis takes it as-is.  Off by default:
+    # the grouped kernel's output is close to but not bit-identical with the
+    # bf16 einsum it replaces.
+    SGLANG_OPT_SM89_GROUPED_FP8_WO_A = EnvBool(False)
+    # Decode fp8 GEMM K-unroll.  On CUDA `select_w8a8_block_fp8_matmul_kernel` returns
+    # `_w8a8_block_fp8_matmul` unconditionally, so the decode fp8 GEMMs -- the step's largest
+    # GPU term (8362 ms of the trace's 15318 ms kernel total) -- never reach
+    # `_w8a8_block_fp8_matmul_unrolledx4`, which the same file defines and selects only under
+    # `_is_hip`.  That kernel unrolls the K loop 4x with BLOCK_SIZE_K unchanged (so it is
+    # unrelated to the BLOCK_SIZE_K <= block_size[1] ceiling), and measured cold on the four
+    # decode shapes it is `torch.equal` bitwise-exact and 1.20x / 0.93x / 1.21x / 1.10x faster
+    # at their shipped tiles -- 1.93x / 1.57x at BLOCK_SIZE_N=32 with num_warps=4.  Unroll
+    # depth saturates at 4 (x8 regresses), and num_warps=4 beats the shipped 8.  The M<=8 arm
+    # only; prefill's M>=16384 keeps the default kernel.  Off by default until an in-situ A/B.
+    SGLANG_OPT_FP8_DECODE_UNROLL = EnvBool(False)
+    # Task #18 re-admission A/B: admit SM89 to the small (m<=8) decode/verify arm of
+    # `hc_combine_norm` in `DeepseekV4DecoderLayer._hc_combine`.  The offline kernel is
+    # bitwise identical and 1.65x faster, but the 2026-09-24 paired decode A/B read
+    # ~+15 ms/step and it was reverted -- except that arm differed by this AND the
+    # backend's indexer crop, and the crop is now the default and separately verified,
+    # so this has never been measured alone.  Default off until that A/B is run.
+    SGLANG_OPT_SM89_HC_FUSE_SMALL = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.

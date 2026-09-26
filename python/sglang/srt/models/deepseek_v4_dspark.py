@@ -1071,14 +1071,39 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        # gamma comes from the tap, not self.gamma: the tap is produced by the draft
+        # sampler, which runs on the RUNTIME gamma (speculative_num_draft_tokens - 1),
+        # and that can differ from this model's own draft-config gamma.  Re-deriving it
+        # here inflates the viewed width by that ratio and the confidence projection
+        # then rejects the shape.
+        gamma = int(x_post_hc.shape[0]) // bs
+        hidden_size = int(x_post_hc.shape[-1])
+        _tap_in = tuple(x_post_hc.shape)
+        x_post_hc = x_post_hc.view(bs, gamma, hidden_size)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : gamma - 1]], dim=1
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
+            prev_seq = None
             markov_embed_stack = None
+        import os as _os
+        if (
+            _os.environ.get("SGLANG_DSPARK_CONF_DEBUG") == "1"
+            and not globals().get("_CONFDBG_CONF_DONE")
+        ):
+            globals()["_CONFDBG_CONF_DONE"] = True
+            print(
+                f"CONFDBG conf: bs={bs} gamma={gamma} self_gamma={self.gamma} "
+                f"tap_in={_tap_in} x_post_hc={tuple(x_post_hc.shape)} "
+                f"anchor={tuple(anchor_tokens.shape)} sampled={tuple(sampled_tokens.shape)} "
+                f"prev_seq={None if prev_seq is None else tuple(prev_seq.shape)} "
+                f"markov={None if markov_embed_stack is None else tuple(markov_embed_stack.shape)} "
+                f"with_markov={confidence_head.with_markov} "
+                f"proj_w={tuple(confidence_head.proj.weight.shape)}",
+                flush=True,
+            )
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
         expect(_CONFIDENCE, confidence)

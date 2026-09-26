@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from abc import ABC
 from collections import deque
@@ -58,6 +59,11 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 logger = logging.getLogger(__name__)
+
+# KT_EPLB_HOOK_DEBUG trace state (diagnostic only, see _on_hook).
+_HOOK_DEBUG_N = 0
+_HOOK_DEBUG_LAYER_COUNTS: dict = {}
+_HOOK_DEBUG_SEEN_NUM = False
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
@@ -259,6 +265,30 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
             return
+        if os.environ.get("KT_EPLB_HOOK_DEBUG"):
+            global _HOOK_DEBUG_N, _HOOK_DEBUG_LAYER_COUNTS, _HOOK_DEBUG_SEEN_NUM
+            _HOOK_DEBUG_N += 1
+            layer_idx = self._current_layer_idx.value
+            _HOOK_DEBUG_LAYER_COUNTS[layer_idx] = (
+                _HOOK_DEBUG_LAYER_COUNTS.get(layer_idx, 0) + 1
+            )
+            first_numbered = layer_idx is not None and not _HOOK_DEBUG_SEEN_NUM
+            if first_numbered:
+                _HOOK_DEBUG_SEEN_NUM = True
+            if _HOOK_DEBUG_N <= 2 or first_numbered or _HOOK_DEBUG_N % 500 == 0:
+                import traceback
+
+                depth = 30 if (_HOOK_DEBUG_N <= 2 or first_numbered) else 8
+                where = [
+                    f"{Path(f.filename).name}:{f.lineno}:{f.name}"
+                    for f in traceback.extract_stack(limit=depth + 2)[-(depth + 1) : -1]
+                ]
+                print(
+                    f"[eplb-hook] n={_HOOK_DEBUG_N} layer_idx={layer_idx} "
+                    f"rec={self._recording} distinct_layers={len(_HOOK_DEBUG_LAYER_COUNTS)} "
+                    f"none_count={_HOOK_DEBUG_LAYER_COUNTS.get(None, 0)} stack={where}",
+                    flush=True,
+                )
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
@@ -430,6 +460,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # Same guard as _SelectExpertsSinglePassGatherer: a MoE with no
+        # with_current_layer context (the DSpark draft) has layer_idx=None and
+        # cannot be indexed into this layer-keyed buffer.
+        if layer_idx is None:
+            return
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
         )
@@ -551,6 +586,20 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # A MoE that runs outside any `with_current_layer` context must not be
+        # recorded. The DSpark draft model is exactly that: deepseek_v4_dspark.py
+        # has no with_current_layer of its own, so its MoE fires this hook with
+        # layer_idx=None. `_data` is [num_layers, num_experts], and `_data[None,
+        # :]` is 3-D, so the scatter below dies with "Index tensor must have the
+        # same number of dimensions as self tensor" and takes the scheduler down
+        # on the first decode step.
+        #
+        # Skipping is also the correct semantics, not just a crash guard: the
+        # draft is a separate 128-expert MoE (the target has 384), so its ids
+        # index nothing in the target's row, and the target's layer index has no
+        # meaning for it.
+        if layer_idx is None:
+            return
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(

@@ -446,6 +446,54 @@ if _is_hip:
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
 
 
+def _is_ada_sm89() -> bool:
+    """True on Ada (SM89).
+
+    Several fusions in this file are gated on Blackwell only because that is
+    where they were validated.  Where the kernel itself is arch-neutral -- plain
+    Triton, no TMA/cluster/PDL -- SM89 can take the same fusion, and the fallback
+    is what costs: `hc_combine_norm` replaces `norm(hc_combine(x_flat, ...))`,
+    which materializes TWO [m, 5120] bf16 tensors (168 MiB each at m=16384) with a
+    single fused kernel that writes one.  Admit SM89 only per-fusion, after the
+    savings are measured, never as a blanket platform widening.
+    """
+    return get_platform().device_capability == (8, 9)
+
+
+# SM89 grouped fp8 wo_a.  `wo_a_fp8_gemm_enabled` is DeepGEMM's `fp8_einsum`,
+# which needs 128x128 block scales, so a checkpoint whose wo_a is e4m3 with
+# 32x32 scales gets its wo_a dequantized to bf16 at load -- 2x the read on a
+# step bound by weight traffic, plus 1.34 GB resident.  The 32x32 layout is the
+# one `_w8a8_block_fp8_matmul` already serves for wq_b/wo_b on this box, so a
+# Triton grouped GEMM over the o-group axis takes the checkpoint as it is.
+# Resolved once at import; ``None`` means the bf16 absorb GEMM stays.
+_wo_a_fp8_grouped = None
+if _is_cuda and _is_ada_sm89() and envs.SGLANG_OPT_SM89_GROUPED_FP8_WO_A.get():
+    from sglang.kernels.ops.quantization.fp8_kernel import wo_a_fp8_grouped_matmul
+
+    _wo_a_fp8_grouped = wo_a_fp8_grouped_matmul
+
+
+# The token width up to which the grouped fp8 wo_a kernel beats the bf16 einsum.  Measured against
+# that einsum, cold with an L2 flush: 1.16x at T=7, 0.96x at 64, 0.43x at 16384 -- the kernel's
+# BM=16/BN=64 tile is only worth it at the verify width, so the wide path keeps the einsum.
+_WO_A_FP8_GROUPED_MAX_TOKENS = 8
+
+
+def _wo_a_fp8_grouped_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+    """True when the SM89 grouped block-fp8 wo_a GEMM can take this quant config.
+
+    The complement of `wo_a_fp8_gemm_enabled`: that one requires the 128x128
+    block scales DeepGEMM's `fp8_einsum` wants, this one requires the 32x32
+    e4m3+ue8m0 layout the served checkpoint actually ships.
+    """
+    return (
+        _wo_a_fp8_grouped is not None
+        and isinstance(quant_config, Fp8Config)
+        and quant_config.weight_block_size == [32, 32]
+    )
+
+
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor,
     wo_a: torch.Tensor,
@@ -455,8 +503,9 @@ def _apply_wo_a_bf16_matmul(
     is_prefill: bool = False,
     fast_path: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
-    # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
-    # on the exact validated TP4 shapes and write token-major output directly.
+    # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are shape-generic on a
+    # contiguous (G, R, D) weight (the kernels derive G, R and D from it) and write token-major
+    # output directly.  Only the MXFP8 epilogue is still baked to the TP4 (2, 1024, 4096) layout.
     global _wo_a_aiter_batched_gemm_disabled
     if (
         fast_path
@@ -465,11 +514,20 @@ def _apply_wo_a_bf16_matmul(
             (
                 is_decode
                 and o.shape[0] == 1
-                and (get_platform().is_blackwell or get_platform().is_sm90)
+                and (
+                    get_platform().is_blackwell
+                    or get_platform().is_sm90
+                    or _is_ada_sm89()
+                )
             )
             or (
                 is_target_verify
                 and 0 < o.shape[0] <= 384
+                # SM89 is deliberately NOT admitted here.  `wo_a_bf16_small_batch` was measured
+                # against the einsum it would replace at the production (G,R,D)=(8,1024,4096):
+                # 59.0 us vs 52.8 us at m=7, i.e. the kernel LOSES 6.2 us per call and this arm
+                # runs once per layer.  The gemv arm above is the one that wins on SM89 (24.3 vs
+                # 31.5 us at m=1).
                 and get_platform().is_blackwell
             )
             or (
@@ -478,13 +536,20 @@ def _apply_wo_a_bf16_matmul(
                 and get_platform().is_blackwell
             )
         )
-        and o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        and o.shape[1] == wo_a.shape[0]
+        and o.shape[2] == wo_a.shape[2]
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
-        and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(1) == wo_a.shape[2]
+        and o.stride(0) >= o.shape[1] * o.shape[2]
         and wo_a.is_contiguous()
+        # The MXFP8 epilogue's scale layout is shape-specific, so a caller that needs it can only
+        # take the TP4 shape's fast path -- never fall through to the BF16 kernel, which would
+        # return a plain tensor where the caller expects Mxfp8SwizzledInput.
+        and (
+            not fuse_mxfp8_quant
+            or (o.shape[1:] == (2, 4096) and wo_a.shape == (2, 1024, 4096))
+        )
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
@@ -820,6 +885,11 @@ class MqaAttentionBase(nn.Module):
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
+        # Only the owning model may opt in: a caller that passes `wo_a_fp8`
+        # explicitly (the DSpark draft passes False) keeps the bf16 absorb.
+        grouped_fp8: bool = (
+            _wo_a_fp8_grouped_enabled(quant_config) if wo_a_fp8 is None else False
+        )
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -828,7 +898,7 @@ class MqaAttentionBase(nn.Module):
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
-        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
+        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a or grouped_fp8
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -843,6 +913,7 @@ class MqaAttentionBase(nn.Module):
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
+        self.wo_a_fp8_grouped = grouped_fp8
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -2457,6 +2528,44 @@ class MQALayer(MqaAttentionBase):
                     recipe=recipe,
                 )
                 o = output
+            elif self.wo_a_fp8_grouped:
+                # The checkpoint's own fp8 wo_a and its 32x32 block scales, read
+                # by a grouped Triton kernel instead of dequantized to bf16.
+                if o.shape[0] <= _WO_A_FP8_GROUPED_MAX_TOKENS:
+                    o = _wo_a_fp8_grouped(
+                        o,
+                        self.wo_a.weight,
+                        self.wo_a.weight_scale_inv,
+                        num_groups=self.n_local_groups,
+                    )
+                else:
+                    # Wide widths keep the einsum and pay one ~100 MB dequant per layer per chunk
+                    # (~4.5 ms against a ~13 s chunk) to get their bf16 operand back.
+                    from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+                    wo_a = block_quant_dequant(
+                        self.wo_a.weight,
+                        self.wo_a.weight_scale_inv,
+                        [32, 32],
+                        torch.bfloat16,
+                    ).view(self.n_local_groups, self.o_lora_rank, -1)
+                    # `einsum("tgd,grd->tgr")` lowers to a bmm over g and then a PERMUTE, so it
+                    # returns [t, G, R]-shaped with the [G, t, R] stride order, and the
+                    # `o.flatten(1)` before `wo_b` below then copies the whole tensor -- 248 MiB per
+                    # attention layer per chunk at T=15792, which is precisely the allocation that
+                    # OOMs the wide prefill (task #46).  Writing the same bmm into a contiguous
+                    # [t, G, R] buffer is bitwise identical (`ut_woa_contig_fix.py`) and makes that
+                    # flatten a view, so the site holds one tensor instead of a result plus its copy.
+                    t, g, _ = o.shape
+                    o_contig = torch.empty(
+                        t, g, self.o_lora_rank, dtype=o.dtype, device=o.device
+                    )
+                    torch.bmm(
+                        o.permute(1, 0, 2),
+                        wo_a.transpose(1, 2),
+                        out=o_contig.permute(1, 0, 2),
+                    )
+                    o = o_contig
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
@@ -2648,6 +2757,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
+        # The arch half of `_hc_combine`'s fusion predicate.  It reads only frozen
+        # inputs (device capability, model type), and `_hc_combine` runs twice per
+        # layer, so deriving it per call cost ~80 platform-fact reads per decode
+        # step -- `_is_ada_sm89()` alone is the largest single caller of
+        # `PlatformContext.__getattr__` in a decode trace.  The shape half stays at
+        # the call site, because the SM89 admission is deliberately prefill-only.
+        self.is_v41 = config.model_type == "deepseek_v41"
+        self.hc_fused_blackwell = get_platform().is_blackwell
+        self.hc_fused_sm89 = _is_ada_sm89() and self.is_v41
         # The fused post+pre boundary bakes in the same-sublayer pre-mix.
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
@@ -3210,13 +3328,48 @@ class DeepseekV4DecoderLayer(nn.Module):
                 return norm(x[:, 0, :].contiguous())
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
+            # SM89 is admitted for the PREFILL arm only.  The small/verify arm also
+            # fronts the MXFP8 epilogue (`hc_combine_norm_mxfp8`, which asserts
+            # m <= 8) -- a separate fusion with its own validation.
+            #
+            # REVERTED 2026-09-24 (task #18).  Admitting SM89 to the small arm was
+            # BITWISE identical and 1.65x faster as a kernel offline, yet the paired decode
+            # A/B (dec3: same BASE tree, arms differing only by this + the backend's indexer
+            # crop) measured it ~+15 ms/step SLOWER -- code step 171.5 -> 186.4 ms and
+            # 35.0 -> 30.9 tok/s, consistent across 3 code + 2 bst runs.  Replacing two
+            # kernels with one faster kernel is not automatically a faster step.  Which of
+            # #18 / #15 carries the regression is not yet bisected, so both are held out.
+            # The init-static platform bools are kept so this still costs no per-call reads.
+            _hc_fused = self.hc_fused_blackwell or (
+                self.hc_fused_sm89
+                and (
+                    4096 <= x.shape[0] <= 65536
+                    # Task #18 re-admission A/B.  Admitting SM89 to the small
+                    # decode/verify tile was reverted on 2026-09-24 because the
+                    # paired decode A/B read ~+15 ms/step -- but that arm differed
+                    # by this AND the backend's indexer crop, and the crop is now
+                    # the default and separately verified, so this has never been
+                    # measured on its own.  The kernel itself was bitwise identical
+                    # and 1.65x faster offline.
+                    or (
+                        envs.SGLANG_OPT_SM89_HC_FUSE_SMALL.get()
+                        and 0 < x.shape[0] <= 8
+                        # dec3's scoping, preserved: the mxfp8 epilogue below
+                        # (`hc_combine_norm_mxfp8`, reached by `quantize and
+                        # x.shape[0] <= 8`) is unvalidated on SM89 and must stay
+                        # Blackwell-only, so SM89's small arm admits the plain
+                        # `hc_combine_norm` only.
+                        and not quantize
+                    )
+                )
+            )
             if (
                 x.is_cuda
-                and get_platform().is_blackwell
+                and _hc_fused
                 and (
                     0 < x.shape[0] <= 8
                     or (
-                        self.config.model_type == "deepseek_v41"
+                        self.is_v41
                         and 4096 <= x.shape[0] <= 65536
                     )
                 )
@@ -3417,6 +3570,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         pre-mix. Returns (hidden_states, ffn_pre)."""
         from functools import partial
 
+        # Task #36 sub-layer probe: rows 1000+10*layer+k, k = 0 attn input, 1 raw attention
+        # output, 2 attention sublayer output, 3 ffn/MoE input.  Bisects inside a layer in the
+        # same run as the layer-level probe above, halving the number of boots a refinement needs.
+        _hs_dump = _debug_hs_active(forward_batch)
+        _hs_base = 1000 + 10 * self.layer_id
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
         attn_quantized: Optional[list] = (
@@ -3438,6 +3596,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             quantized=attn_quantized,
             precomputed=precomputed_attn,
         )
+        if _hs_dump:
+            _debug_hs_row(_hs_base + 0, x)
         attn_mhc = None
         if (
             self.config.model_type == "deepseek_v41"
@@ -3489,6 +3649,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=attn_quantized[0] if attn_quantized else None,
             )
+        if _hs_dump:
+            _debug_hs_row(_hs_base + 1, x)
         if attn_mhc is not None:
             attn_mhc.materialize_stats()
             attn_pre = attn_mhc.pre
@@ -3498,6 +3660,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
             hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        if _hs_dump:
+            _debug_hs_row(_hs_base + 2, hidden_states)
 
         residual = hidden_states
         ffn_stats = partial(
@@ -3515,6 +3680,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             stats_stream=stats_stream,
             normalized=attn_mhc.normalized if attn_mhc is not None else None,
         )
+        if _hs_dump:
+            _debug_hs_row(_hs_base + 3, x)
         mhc = None
         if (
             self.config.model_type == "deepseek_v41"
@@ -4009,6 +4176,43 @@ def _scatter_tail_rows(
     return full
 
 
+# Debug instrument for task #36: dump the target-verify forward's hidden states per layer so an
+# eager-vs-graph diff can name the layer where capture first changes the numerics.  Host-side only and
+# skipped while capturing (see the env docs in `environ.py`); the flush is per decode step so a step's
+# rows never alias the next step's static buffers.
+_DEBUG_HS = {"step": 0, "layers": None, "rows": []}
+
+
+def _debug_hs_active(forward_batch: ForwardBatch) -> bool:
+    return (
+        envs.SGLANG_DEBUG_DECODE_HS_DUMP.get() is not None
+        and forward_batch.forward_mode.is_target_verify()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _debug_hs_layer_set() -> frozenset:
+    if _DEBUG_HS["layers"] is None:
+        raw = envs.SGLANG_DEBUG_DECODE_HS_LAYERS.get()
+        _DEBUG_HS["layers"] = frozenset(
+            int(x) for x in raw.split(",") if x.strip()
+        ) if raw else frozenset()
+    return _DEBUG_HS["layers"]
+
+
+def _debug_hs_row(layer_index: int, tensor: torch.Tensor) -> None:
+    _DEBUG_HS["rows"].append((layer_index, tensor.detach().clone()))
+
+
+def _debug_hs_flush() -> None:
+    dump_dir = envs.SGLANG_DEBUG_DECODE_HS_DUMP.get()
+    if dump_dir is None or not _DEBUG_HS["rows"]:
+        return
+    torch.save(_DEBUG_HS["rows"], f"{dump_dir}/hs_step{_DEBUG_HS['step']:03d}.pt")
+    _DEBUG_HS["rows"] = []
+    _DEBUG_HS["step"] += 1
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4372,6 +4576,8 @@ class DeepseekV4Model(nn.Module):
         saved_full = None
         prev_pre = None
         precomputed_attn = None
+        _hs_dump = _debug_hs_active(forward_batch)
+        _hs_layers = _debug_hs_layer_set() if _hs_dump else frozenset()
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
@@ -4389,16 +4595,36 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
+                # The vision restore below needs the pre-gate rows, so the gate may
+                # only write through its input when there is nothing to restore: a
+                # text-only batch, where the torch.where is the identity.  It is
+                # worth it -- the gate's output is an equal-sized [T, hc_mult, dim]
+                # bf16 transient (1.25 GiB at T=16384, 2.5 GiB at T=32768) and the
+                # layerwise prefill's batch budget is what that transient breaks.
+                _engram_restore = (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                )
+                # Host-side, NOT `(input_ids == image_token_id).any()`: that `bool()` is a
+                # device->host sync, illegal inside a stream capture.  It is what killed the
+                # breakable decode graph -- `cudaErrorStreamCaptureUnsupported` raised at the
+                # `bool(` and surfaced as `...Invalidated` at `capture_end()`.  The breakable
+                # graph re-runs this Python every step, so the live ForwardBatch is the same
+                # input the sync would have read.  The two differ only for a multimodal request
+                # whose CURRENT step carries no image row (a decode step), and there this takes
+                # the safe branch: `in_place=False` plus a `torch.where` whose image mask is
+                # all-false, i.e. the identity.
+                _engram_in_place = (
+                    _engram_restore and not forward_batch.contains_image_inputs()
+                )
                 hidden_states = engram(
                     hidden_states,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
                     cp_all_tokens=cp_extend,
+                    in_place=_engram_in_place,
                 )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if _engram_restore and not _engram_in_place:
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
@@ -4459,6 +4685,11 @@ class DeepseekV4Model(nn.Module):
                     next_input=next_input,
                 )
             precomputed_attn = next_input[0] if next_input else None
+            if _hs_dump and i in _hs_layers:
+                # This is the layer stack V4.1-Flash actually runs (`config.hc_pre_from_prev_sublayer`),
+                # so it is the hook that fires; the twin in `forward`'s else-branch covers the other
+                # layer scheme.
+                _debug_hs_row(i, hidden_states.flatten(1))
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return hidden_states, prev_pre, tail
@@ -4623,6 +4854,8 @@ class DeepseekV4Model(nn.Module):
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
+        _hs_dump = _debug_hs_active(forward_batch)
+        _hs_layers = _debug_hs_layer_set() if _hs_dump else frozenset()
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4698,6 +4931,8 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+                if _hs_dump and i in _hs_layers:
+                    _debug_hs_row(i, hidden_states.flatten(1))
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
@@ -4728,6 +4963,12 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+
+        if _hs_dump:
+            _debug_hs_row(-1, hidden_states)
+            _debug_hs_row(-2, forward_batch.input_ids)
+            _debug_hs_row(-3, forward_batch.positions)
+            _debug_hs_flush()
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
@@ -5786,10 +6027,18 @@ def _prepare_deepseek_v4_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Keep Expert Pack GGUF weights on the streaming load path."""
+    """Prepare the model's own weight stream: Expert Pack GGUF weights stay on the
+    streaming path, and the fp8 wo_a is only dequantized when nothing can read it."""
 
     if quant_config is not None and quant_config.get_name() == "expert_pack":
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+        return weights
+    if _wo_a_fp8_grouped_enabled(quant_config):
+        # The grouped kernel reads the checkpoint's fp8 wo_a directly, so
+        # dequantizing it here would both throw away the weight it needs and put
+        # 1.34 GB back on the card.  This is the model's own weight stream; the
+        # DSpark draft has its own load and keeps the bf16 absorb.
+        logger.info("Keeping fp8 wo_a for the SM89 grouped block-fp8 absorb GEMM")
         return weights
     return _dequant_fp8_wo_a_streaming(weights)
 

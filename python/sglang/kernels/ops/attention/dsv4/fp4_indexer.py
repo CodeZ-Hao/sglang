@@ -369,6 +369,23 @@ def _fp4_index_logits_kernel(
     )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
 
     n_vis = tl.load(lens_ptr + b)
+    # Retire on the DEVICE, not on the grid: a captured decode graph has a frozen grid and
+    # `_low_ratio_index_topk_sm90_decode` (deepseek_v4_backend.py:3614) deliberately skips its
+    # host live-length crop while the stream is capturing -- a host length read there would both
+    # synchronize and truncate replay.  So the captured grid is the page table's CAPACITY
+    # (cdiv(524422, 64) per batch row at 1M), which the pre-crop trace prices at 24.95 ms/forward
+    # against ~1.07 ms/forward for the entire torch-side topk family.  `n_vis` is already loaded
+    # and the tail store below already writes -inf past it, so this only skips the query load,
+    # the two `tl.dot`s and the scale chain for programs that cannot reach a live position; the
+    # live columns keep the identical arithmetic.  `out` is `torch.empty`, so the tail store
+    # here is what must happen for the -inf contract to hold.
+    if lb * BLOCK_L >= n_vis:
+        tl.store(
+            out_ptr + b * L + offs_l,
+            tl.zeros((BLOCK_L,), dtype=tl.float32) - float("inf"),
+            mask=offs_l < L,
+        )
+        return
     valid = offs_l < tl.minimum(n_vis, L)
     slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
     page = slot // page_size

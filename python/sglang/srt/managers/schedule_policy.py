@@ -92,6 +92,7 @@ def _use_exact_chunk_fill() -> bool:
     return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
 
 
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -1433,6 +1434,28 @@ class PrefillAdder:
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
         assert len(req.prefix_indices) == admission.prefix_len
+        if envs.SGLANG_DEBUG_CUDA_MEM_DUMP.get() is not None:
+            # `Prefill batch` is emitted only AFTER a chunk's forward returns, so a request that
+            # dies mid-chunk logs no chunk sizes at all and the SEQUENCE is invisible -- which is
+            # exactly the fact needed to see whether the last-chunk cap fired. `rows` is the row
+            # count the layers will see, decided here at admission. The allocator trio is logged
+            # with it so a PASSING request's footprint can be compared against a failing one's
+            # without the dump instrument (which only fires on the exception).
+            import torch as _torch
+
+            logger.info(
+                "[admit] rows=%d prefix=%d chunked=%s pending=%d rem_chunk=%s req_total=%d "
+                "alloc=%.3f max=%.3f reserved=%.3f GiB",
+                admission.extend_len,
+                admission.prefix_len,
+                admission.is_chunked,
+                len(req.full_untruncated_fill_ids) - admission.prefix_len,
+                self.rem_chunk_tokens,
+                len(req.full_untruncated_fill_ids),
+                _torch.cuda.memory_allocated() / (1 << 30),
+                _torch.cuda.max_memory_allocated() / (1 << 30),
+                _torch.cuda.memory_reserved() / (1 << 30),
+            )
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )

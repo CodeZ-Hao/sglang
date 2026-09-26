@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -314,11 +315,37 @@ class DeepSeekMxfp4MoEMethod:
         # reserved for an ordinary full-expert layer or the manager's full
         # prefill shadow.
         _resident_partial = _resident_experts < _global_experts
+        # ...EXCEPT under SGLANG_KT_RESIDENT_MARLIN=1, which is the A/B for a
+        # measured cost, not a preference.  With --kt-num-gpu-experts N the
+        # partial image takes the triton_kernels matmul_ogs path, and that path
+        # costs ~1.24 ms of HOST time per layer per step on this box while
+        # nvidia-smi utilisation stays flat at 35% (measured 2026-09-22) -- i.e.
+        # the placement's ~20 ms of saved CPU bytes are paid back as launch
+        # cost, which is why 10 experts/layer measured -22% (code) / -30%
+        # (bst).  Marlin is already in this tree and already selected for SM89;
+        # it is a single fused launch, so the partial image is allowed onto it
+        # behind this flag.  The dispatch already keys on _v4_marlin_path.
+        # The `> 0` matters: the MTP draft's layers keep ALL experts on the CPU
+        # (kt-mask logs "layer N has 128 experts but the placement table
+        # describes 384"), so their resident image is empty and
+        # prepare_v4_mxfp4_marlin would raise "num_experts must be positive,
+        # got 0" at load.
+        _resident_marlin = (
+            os.environ.get("SGLANG_KT_RESIDENT_MARLIN") == "1"
+            and _resident_partial
+            and _resident_experts > 0
+        )
+        # The layerwise fallback sources every expert -- residents included --
+        # from the KT host pool when this is set, so the resident raw slice is
+        # dead weight from load onward.
+        _release_resident_raw = (
+            os.environ.get("KT_PREFILL_RELEASE_RESIDENTS") == "1"
+        )
         _take_marlin_path = (
             not _force_tk
             and not _force_trtllm
             and _capability in _MARLIN_MXFP4_CAPS
-            and not _resident_partial
+            and (not _resident_partial or _resident_marlin)
         )
         if _take_marlin_path:
             from sglang.srt.layers.quantization.v4_marlin_moe import (
@@ -349,6 +376,25 @@ class DeepSeekMxfp4MoEMethod:
                 del layer.w2_weight
                 del layer.w13_weight_scale_inv
                 del layer.w2_weight_scale_inv
+            elif _release_resident_raw:
+                # KT_PREFILL_RELEASE_RESIDENTS=1: with the layerwise pipeline
+                # armed, the fallback repacks from the KT host pool
+                # (`_build_mxfp4_host_cache_entry(include_gpu_experts=True)`) and
+                # `_KT_RESIDENTS_RAW_RELEASED` sends Phase 1 down its all-CPU arm,
+                # so nothing reads this layer's raw slice.  Dropping it HERE
+                # rather than at slot-allocation time is what lets a large N load
+                # at all: raw + Marlin is 2x the expert bytes (14.68 GiB at N=10,
+                # needs mfs >= 0.947 and refuses) where Marlin alone is 1x
+                # (7.34 GiB, mfs >= 0.676).
+                #
+                # setattr-to-None, not `del`: the full-GPU prefill gate is
+                # `hasattr(layer, "w13_weight")` (kt_ep_wrapper.py:6142), so
+                # deleting the attribute would disable the layerwise path
+                # outright instead of only rerouting its Phase 1.
+                layer.w13_weight = None
+                layer.w2_weight = None
+                layer.w13_weight_scale_inv = None
+                layer.w2_weight_scale_inv = None
             layer._v4_marlin_path = True
             return
 

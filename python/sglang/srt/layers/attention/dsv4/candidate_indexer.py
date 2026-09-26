@@ -62,12 +62,33 @@ def make_candidate_indexer(
     return DeepGemmCandidateIndexer(topk_blocks, block_size)
 
 
-# TODO(candidate): Hopper decode and prefill still select through these masks
-# inline in the backend; move them behind the protocol as publish/select_prefill.
+# TODO(candidate): the dense-fp4 prefill (sm100) and the Hopper decode still select
+# through these masks inline in the backend; move them behind the protocol too.
 @dataclass
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
-    request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    # prefill, the dense-fp4 path (sm100): [rows_b, lc_b] bool each.
+    request_masks: Optional[List[torch.Tensor]] = None
+    # prefill, the torch path: the same selection as `request_masks` but as block ids --
+    # `select_candidate_block_ids`'s `blocks`, [rows_b, min(topk_blocks, num_blocks)] int64
+    # ascending with the pad `num_blocks` LAST.  The candidate WIDTH is the constant
+    # topk_blocks x block_size while the mask spans `lc`, so the ids are O(chunk x topk_blocks)
+    # and the mask is O(chunk x lc): at chunk 16384 with lc 81920 that is 268 MiB against
+    # 1280 MiB, and the mask's own `torch.cat` is the 1.25 GiB allocation that OOMs a
+    # >32768-token prompt at the shipping chunk (task #44).  A consumer rebuilds the mask for
+    # one row slice with `expand_candidate_block_ids`.
+    request_blocks: Optional[List[torch.Tensor]] = None
+    # decode, sm<100 only: the same selection as `mask` but as block ids, so a
+    # consumer can gather just the candidate columns instead of scoring the full
+    # width and masking after (`SGLANG_OPT_SM89_CANDIDATE_PRUNE_SCORE`).
+    # `blocks` is [rows, min(topk_blocks, num_blocks)] int64 ascending with the
+    # padding LAST, and `block_lens` is [rows] int64, the number of VALID candidate
+    # columns per row.  Within a row, positions increase across the flattened
+    # block-by-block layout, so the first `block_lens[b]` columns of that layout are
+    # exactly the valid ones -- a prefix, which is what the logits kernel's `lens`
+    # argument needs.
+    blocks: Optional[torch.Tensor] = None
+    block_lens: Optional[torch.Tensor] = None
 
 
 def published_masks(candidate) -> CandidateMasks:
@@ -116,3 +137,62 @@ def select_candidate_blocks(
         -1, top.indices, top.values > -torch.inf
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_candidate_block_ids(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> tuple:
+    """`select_candidate_blocks`'s selection published as block ids rather than a mask,
+    so a consumer can gather the candidate columns and score only those. Returns
+    `(blocks, block_lens)`: `blocks` is ``[rows, min(topk_blocks, num_blocks)]`` int64
+    ASCENDING with the padding at the END (a pad is the value ``num_blocks``, which is also
+    its validity flag), and `block_lens` is ``[rows]`` int64, the number of valid candidate
+    columns. Within a row the first `block_lens[b]` columns of the flattened block-by-block
+    layout are exactly the valid ones -- a prefix, because positions increase inside a block
+    and the blocks ascend -- which is the shape the logits kernel's `lens` argument needs.
+
+    The width is `min(topk_blocks, num_blocks)` and NOT `topk_blocks`: padding a short
+    sequence's block list out to `topk_blocks` would make the compacted layout WIDER than
+    `lmax` itself (16384 columns for a 36-column row) and turn the prune into a large
+    pessimisation exactly where the full-width path was already cheap."""
+    lens = compress_lens.reshape(-1)
+    width = logits.size(-1)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last[:, None], torch.inf
+    )
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    pad = num_blocks
+    blocks = top.indices.masked_fill(top.values == -torch.inf, pad).sort(dim=-1).values
+
+    offsets = torch.arange(block_size, device=logits.device)
+    positions = blocks.clamp_max(num_blocks - 1)[:, :, None] * block_size + offsets
+    valid = (blocks[:, :, None] < num_blocks) & (positions < lens[:, None, None])
+    return blocks, valid.sum(dim=(1, 2))
+
+
+def expand_candidate_block_ids(
+    blocks: torch.Tensor, block_size: int, width: int
+) -> torch.Tensor:
+    """Rebuild `select_candidate_blocks`'s `[rows, width]` mask from `select_candidate_block_ids`'s
+    `blocks`, for ONE row slice: expanding only the slice is what keeps the published state
+    O(rows x topk_blocks) instead of O(rows x width).
+
+    The `num_blocks + 1` columns exist so the pads -- whose value is exactly `num_blocks` -- land
+    one past the real blocks and write False there.  A pad can therefore never overwrite a
+    selected block, and duplicates only ever occur among the pads, which agree.  The selection is
+    `top.values > -inf` in `select_candidate_blocks`, i.e. `blocks < num_blocks` here, so the
+    result is bitwise the mask `select_candidate_blocks` returns."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        blocks.shape[0], num_blocks + 1, dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(1, blocks, blocks < num_blocks)
+    return keep[:, :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]

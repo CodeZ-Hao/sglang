@@ -927,9 +927,17 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    in_place: bool = False,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy."""
+    followed by the shared value. Adds the gated value to every copy.
+
+    ``in_place`` lets the fused kernel write back into ``x`` instead of
+    allocating an equal-sized output, which halves this op's transient.  It is
+    only valid when the caller holds no other reference to ``x``: the model
+    keeps one (`before_engram`) for the vision-token restore, so the caller
+    decides.  The unfused fallback ignores the flag.
+    """
     if (
         _cuda_kernels(x)
         and x.ndim == 3
@@ -940,7 +948,15 @@ def engram_gate(
         and k_weight.dtype in (torch.bfloat16, torch.float32)
         and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x,
+            kv,
+            q_weight,
+            k_weight,
+            eps,
+            clamp_value,
+            out=x if in_place else None,
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -991,6 +1007,7 @@ class Engram(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         *,
         cp_all_tokens: bool = False,
+        in_place: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
@@ -1002,5 +1019,11 @@ class Engram(nn.Module):
             return x
         kv, _ = self.wkv(emb.flatten(-2))
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            in_place=in_place,
         )

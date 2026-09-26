@@ -22,7 +22,11 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+# Was `sglang.srt.layers.quantization.fp8_kernel`, which does not exist -- the
+# module lives under sglang/kernels/ops since the quantization split, so this
+# script has never run as written and no config for our own shapes was ever
+# produced. Its default --output-dir had the same stale path (below).
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     _w8a8_block_fp8_matmul,
 )
 
@@ -36,6 +40,13 @@ DEFAULT_SHAPES = (
     (8192, 1024),
 )
 M_VALUES = (1, 2, 4, 8)
+
+
+def m_values_of(args) -> tuple[int, ...]:
+    values = tuple(int(x) for x in str(args.m_values).split(",") if x.strip())
+    if not values:
+        raise ValueError("--m-values must list at least one M")
+    return values
 DEFAULT_CONFIG = {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
@@ -137,7 +148,7 @@ def choose_stable_fastest(results):
 def tune_shape(n, k, args, flush):
     tuned = {}
     measurements = {}
-    for m in M_VALUES:
+    for m in m_values_of(args):
         torch.manual_seed(args.seed + m)
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16).to(
             torch.float8_e4m3fn
@@ -216,8 +227,9 @@ def tune_shape(n, k, args, flush):
         )
 
     # The loader chooses the closest M key.  This key restores the old default
-    # for every M >= 9, including all ordinary prefill batches.
-    tuned["9"] = DEFAULT_CONFIG
+    # for every M >= 9, including all ordinary prefill batches. setdefault so an
+    # explicitly tuned M=9 is not clobbered.
+    tuned.setdefault("9", DEFAULT_CONFIG)
     return tuned, measurements
 
 
@@ -228,13 +240,26 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=Path,
+        # `get_w8a8_block_fp8_configs` reads os.path.dirname(fp8_kernel.__file__)
+        # + "/configs", i.e. sglang/kernels/ops/quantization/configs. The old
+        # default pointed at sglang/srt/layers/quantization/configs, which does
+        # not exist -- writing there is a silent no-op.
         default=REPO_ROOT
         / "python"
         / "sglang"
-        / "srt"
-        / "layers"
+        / "kernels"
+        / "ops"
         / "quantization"
         / "configs",
+    )
+    parser.add_argument(
+        "--m-values",
+        default="1,2,4,8",
+        help="Comma-separated M keys to tune. Must include every decode-time M, "
+        "because the loader picks min(keys, key=lambda x: abs(x-M)) and a tie "
+        "resolves to the lowest key. Single-stream DSpark block-5 decode is "
+        "M=6 (bs x verify tokens = 1 x 6), so leave it out and M=6 silently "
+        "falls back to whichever of 4/8 is scanned first.",
     )
     parser.add_argument("--measurement-dir", type=Path)
     parser.add_argument("--rounds", type=int, default=3)

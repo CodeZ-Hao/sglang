@@ -1877,6 +1877,28 @@ _PLATFORM_VALUES: Dict[str, str] = {
 }
 
 
+# Resolved probe functions, filled on first read of each fact.
+#
+# `__getattr__` is the ONLY path to these names (they are not in the instance
+# dict), so it runs in hot loops -- a decode step reads platform facts ~1,000
+# times from a dozen call sites, and `_is_ada_sm89()` alone accounts for 1,185 of
+# them.  A function-local `from sglang.srt.utils import common` per read costs
+# ~1.5 us of `importlib._handle_fromlist` for an already-imported module, which is
+# most of the measured 1.9 us per read; the probes themselves are `lru_cache`-d.
+# Caching the FUNCTION (not the value) leaves the `override_platform` protocol
+# exactly as it was.
+_PLATFORM_PROBE_FUNCS: Dict[str, Any] = {}
+
+
+def _platform_probe(name: str):
+    fn = _PLATFORM_PROBE_FUNCS.get(name)
+    if fn is None:
+        from sglang.srt.utils import common as _common
+
+        fn = _PLATFORM_PROBE_FUNCS[name] = getattr(_common, name)
+    return fn
+
+
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
@@ -1900,9 +1922,7 @@ class PlatformContext:
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
-
-        return getattr(_common, probe)()
+        return _platform_probe(probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(

@@ -234,6 +234,7 @@ def fused_sm8x_fp8_attn(
     extra_indices=None,
     extra_topk_lengths=None,
     extra_page_size: int = 0,
+    in_place: bool = False,
 ) -> "torch.Tensor":
     """One-launch fused FP8 SWA (+ c4/c128) attention.
 
@@ -258,26 +259,67 @@ def fused_sm8x_fp8_attn(
     else:
         extra_topk = 0
 
-    swa_u8 = swa_cache.contiguous().view(torch.uint8)
-    swa_bytes_per_page = swa_u8.shape[-1]
+    # Neither cache is copied: `page_stride` is the tensor's own dim-0 stride, and the dtype
+    # views are handed to the kernel strided rather than flattened.
+    #
+    # The copied one was `extra_cache`, and the trace names it (`ut_fp8copy_aten.py`,
+    # `ut_copy_price.py` over a 15-step decode window):
+    #
+    #     aten::contiguous  [[513, 256, 1, 584]]  Float8_e4m3fn  20.0/step  (0.72 ms/step CPU)
+    #     aten::contiguous  [[513, 128, 1, 584]]  Float8_e4m3fn  18.0/step  (0.68 ms/step CPU)
+    #     float8_copy kernel                                      38.0/step  (7.95 ms/step DEVICE)
+    #
+    # 38 = the layers carrying a compressed window, and both page sizes are the extra
+    # cache's.  `swa_cache` is NOT copied: the SM8x caller passes `swa_k_cache_raw`, the 2-D
+    # contiguous pool buffer that `create_buffer` allocates as
+    # `torch.zeros(num_pages, page_bytes(page_size))`, on which `.contiguous()` is a no-op --
+    # no [513, 128, 1, 584] copy of the SWA's used bytes appears in the trace, because the
+    # SWA pool is never sliced.
+    #
+    # `extra_cache` IS the 4-D view built at `deepseek_v4_backend.py:3785` from
+    # `extra_k_cache[:, :eps * total].view(pages, eps, 1, total)`: the c4/c128 pool pads each
+    # page row up to `KVLayout.page_bytes(eps)` (128 B at eps=128, 256 B at eps=256), so the
+    # slice is non-contiguous in dim 0 and `.contiguous()` materialized a compact copy of the
+    # whole cache on every layer of every step -- 145.8 us at eps=128 and 290.4 us at 256
+    # against a 33 us kernel.
+    #
+    # The kernel consumes a cache as a flat pointer with a page stride
+    # (`page_idx * <PAGE_BYTES> + in_page * NOPE_ROPE_BYTES`, and
+    # `page_idx * <PAGE_BYTES> + PAGE_SIZE * NOPE_ROPE_BYTES + in_page * PADDED_SCALE_PER_TOKEN`
+    # for the scales) and computes every other offset itself, so per-page padding is fully
+    # expressed by that stride.  `ut_sm8x_wrapper_cache.py` feeds this wrapper the production
+    # object pair (2-D SWA raw + 4-D strided extra) at both page sizes and reproduces the
+    # compacted result byte for byte (differing bytes = 0), 183.3 -> 34.3 us at eps=128 and
+    # 328.5 -> 32.8 us at eps=256.
+    #
+    # `reshape(-1)` is what forces the copy even when the stride is already right, so the
+    # views stay strided.
+    swa_u8 = swa_cache.view(torch.uint8)
+    swa_bytes_per_page = swa_u8.stride(0)
     fp8_dtype = swa_u8.view(torch.float8_e4m3fn).dtype
-    swa_fp8 = swa_u8.view(fp8_dtype).reshape(-1)
-    swa_bf16 = swa_u8.view(torch.bfloat16).reshape(-1)
-    swa_u8f = swa_u8.reshape(-1)
+    swa_fp8 = swa_u8.view(fp8_dtype)
+    swa_bf16 = swa_u8.view(torch.bfloat16)
+    swa_u8f = swa_u8
 
     if has_extra:
-        extra_u8 = extra_cache.contiguous().view(torch.uint8)
-        extra_bytes_per_page = extra_u8.numel() // extra_u8.shape[0]
-        extra_fp8 = extra_u8.view(fp8_dtype).reshape(-1)
-        extra_bf16 = extra_u8.view(torch.bfloat16).reshape(-1)
-        extra_u8f = extra_u8.reshape(-1)
+        extra_u8 = extra_cache.view(torch.uint8)
+        extra_bytes_per_page = extra_u8.stride(0)
+        extra_fp8 = extra_u8.view(fp8_dtype)
+        extra_bf16 = extra_u8.view(torch.bfloat16)
+        extra_u8f = extra_u8
     else:
         extra_fp8 = extra_bf16 = extra_u8f = swa_fp8
         extra_bytes_per_page = swa_bytes_per_page
 
     swa_topk = swa_indices.shape[1]
     num_head_groups = num_heads // _BLOCK_H
-    out = torch.empty_like(q)
+    # Each program reads q[pid_q] once and writes out[pid_q], so out may alias q
+    # unless the caller still needs q.  The layerwise prefill's VRAM budget is
+    # what this buys: at num_q=16384 the tile is 1024 MiB, and that single
+    # allocation is what the 32768-token prefill dies on with 31 MiB free
+    # (fused_sm8x_fp8_attn.py:280 in the traceback).  The chunked caller passes
+    # out_in=q when it does not need its own slice afterwards.
+    out = q if in_place else torch.empty_like(q)
     grid = (num_q, num_head_groups)
     _fused_sm8x_fp8_attn_kernel[grid](
         q,

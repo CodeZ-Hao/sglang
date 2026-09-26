@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -495,6 +498,95 @@ def topk_transform_paged_from_metadata(
         )
 
 
+def _indexer_page_budget(seq_lens_cpu, *, page_size: int, num_pages: int) -> int:
+    """Page-table width a batch of these sequence lengths can actually reach.
+
+    ``fp8_paged_mqa_logits_torch`` materializes a dense score rectangle whose
+    width is the *page table's* width -- an integer set by the memory pool's
+    nominal capacity (``--max-total-tokens / page_size``), not by the batch, so
+    the SM89 fallback pays for the whole nominal context in all 8 indexer layers
+    on every step even when the batch is a few hundred tokens long. Positions
+    past the real length are masked to ``-inf`` downstream, so cropping the
+    rectangle to the pages the batch can touch leaves the logits unchanged.
+
+    Two pages of slack absorb the speculative draft tokens and any rounding in
+    the compressor's own length bookkeeping. Callers must pass the *nominal*
+    width for a graph-captured batch: a captured shape cannot follow seq_lens.
+    """
+    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+        return num_pages
+    longest = max(int(x) for x in seq_lens_cpu)
+    return min((longest + page_size - 1) // page_size + 2, num_pages)
+
+
+_INDEXER_TIME: Dict[str, List[float]] = {}
+_INDEXER_TIME_CALLS = 0
+
+
+def _indexer_ab_pages(cropped: Optional[int], layer_id: int, nominal: int) -> Optional[int]:
+    """Rectangle width for this layer, alternating the two variants when asked.
+
+    ``KT_INDEXER_AB=1`` sends even layers to the nominal width and odd ones to
+    the cropped width. Alternating by LAYER rather than by run keeps the
+    comparison paired: the session-to-session spread of a decode step is 11%
+    (137.6 vs 152.9 ms measured on identical config today), which is larger than
+    the rectangle cost being compared, while every indexer layer has the same
+    shape, so the layers are interchangeable. Inert unless the env var is set.
+    """
+    if cropped is None or not os.environ.get("KT_INDEXER_AB"):
+        return cropped
+    return cropped if layer_id % 2 else nominal
+
+
+def _indexer_call(fn: Callable, args: tuple, layer_id: int, pages: int) -> torch.Tensor:
+    """``fn(*args)``, timing the rectangle on the device under KT_INDEXER_TIMING.
+
+    The fallback is a handful of tiny ops over a wide rectangle, so its cost is
+    invisible in a step mean; synchronising around the call makes the
+    rectangle's own time the measured quantity at the price of serialising the
+    pipeline in the measurement leg only.
+    """
+    if not os.environ.get("KT_INDEXER_TIMING"):
+        return fn(*args)
+    global _INDEXER_TIME_CALLS
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = fn(*args)
+    torch.cuda.synchronize()
+    acc = _INDEXER_TIME.setdefault(f"layer{layer_id % 2}/{pages}p", [0, 0.0])
+    acc[0] += 1
+    acc[1] += (time.perf_counter() - t0) * 1e3
+    _INDEXER_TIME_CALLS += 1
+    if _INDEXER_TIME_CALLS % 200 == 0:
+        parts = " ".join(
+            f"{k} n={int(v[0])} {v[1] / v[0]:.3f}ms"
+            for k, v in sorted(_INDEXER_TIME.items())
+        )
+        print(f"[indexer-time] {parts}", flush=True)
+    return out
+
+
+_INDEXER_TRACE_CALLS = 0
+
+
+def _indexer_trace(tag: str, layer_id: int, extra: str = "") -> None:
+    """Breadcrumb at the top of each indexer stage, gated by KT_INDEXER_TRACE=1.
+
+    An indexed trace rather than a mean: it answers "does this path run during
+    decode at all, and how often", which a per-call average cannot -- a mean of
+    zero samples and a mean over prefill-only samples look identical.
+    """
+    global _INDEXER_TRACE_CALLS
+    if not os.environ.get("KT_INDEXER_TRACE"):
+        return
+    _INDEXER_TRACE_CALLS += 1
+    if _INDEXER_TRACE_CALLS <= 8 or _INDEXER_TRACE_CALLS % 200 == 0:
+        print(
+            f"[idx-trace] n={_INDEXER_TRACE_CALLS} {tag} layer={layer_id} {extra}",
+            flush=True,
+        )
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -746,6 +838,11 @@ class C4IndexerBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
+        _indexer_trace(
+            "enter",
+            c4_indexer.layer_id,
+            f"mode={forward_batch.forward_mode} rows={x.shape[0]}",
+        )
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
@@ -871,6 +968,24 @@ class C4IndexerBackendMixin:
             and not use_aiter_fp4
         ):
             _c4sl = _c4sl.unsqueeze(-1)
+        # Only the SM89 torch fallback sizes work by the page table's width; the
+        # real kernels walk seq_lens. Give it the pages this batch can reach, and
+        # keep the nominal width when capturing, where the shape must not follow
+        # a seq_lens that a replay can change.
+        indexer_pages = None
+        if _use_torch_fn and not (
+            torch.cuda.is_current_stream_capturing()
+            or is_in_breakable_cuda_graph()
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            indexer_pages = _indexer_page_budget(
+                forward_batch.seq_lens_cpu,
+                page_size=indexer_metadata.page_size,
+                num_pages=page_table.shape[1],
+            )
+            indexer_pages = _indexer_ab_pages(
+                indexer_pages, c4_indexer.layer_id, page_table.shape[1]
+            )
         nonpaged_plan = None
         if not use_aiter_fp4:
             nonpaged_plan = self._get_nonpaged_indexer_plan(
@@ -1014,15 +1129,30 @@ class C4IndexerBackendMixin:
 
             def run_paged_indexer(rows: slice, metadata: torch.Tensor) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
-                logits = fn(
-                    row_q,
-                    c4_indexer_kv_cache,
-                    weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
-                    metadata,
-                    indexer_metadata.max_compressed_seq_len,
-                    False,
+                row_page_table = page_table[rows]
+                row_max_seq_len = indexer_metadata.max_compressed_seq_len
+                if indexer_pages is not None:
+                    row_page_table = row_page_table[:, :indexer_pages]
+                    row_max_seq_len = (
+                        indexer_pages * indexer_metadata.compressed_page_size
+                    )
+                _indexer_trace(
+                    "paged", c4_indexer.layer_id, f"pages={row_page_table.shape[1]}"
+                )
+                logits = _indexer_call(
+                    fn,
+                    (
+                        row_q,
+                        c4_indexer_kv_cache,
+                        weights[rows],
+                        _c4sl[rows],
+                        row_page_table,
+                        metadata,
+                        row_max_seq_len,
+                        False,
+                    ),
+                    c4_indexer.layer_id,
+                    row_page_table.shape[1],
                 )
                 run_topk_transform(rows, logits)
 
