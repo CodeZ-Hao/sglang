@@ -35,6 +35,13 @@ _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
+# Position slab for `get_index_k_dequant`: that readback costs ~1.8 KB of live temporaries per
+# position (an int64 `[n, 64, 2]` nibble-index tensor dominates), so a whole-request call at a
+# 1M-token context would hold ~GBs at once and it is charged against the same reserve the
+# prefill chunk competes for.  Sizing a slab to ~60 MB bounds it; the split is by position
+# only, so the values are unchanged.
+_INDEX_K_DEQUANT_SLAB = 32768
+
 
 def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
     """Return payload and quant-scale bytes for one compressed indexer token."""
@@ -646,14 +653,34 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
-        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+        """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool.
 
+        Tiled over the position axis.  The unpacking below materialises an int64
+        `[n, 64, 2]` index tensor plus fp32 scales, i.e. ~1.8 KB of temporaries per
+        position, so one whole-request call at a long context held GBs live at once --
+        and it is the term that grows with the COMMITTED length rather than with the
+        prefill chunk.  A slab is a pure position slice, so every value is identical to
+        the untiled computation.
+        """
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)
         slots = slots.to(torch.int64)
+        if slots.numel() <= _INDEX_K_DEQUANT_SLAB:
+            return self._dequant_index_k_slab(buf, slots)
+        return torch.cat(
+            [
+                self._dequant_index_k_slab(buf, slots[start : start + _INDEX_K_DEQUANT_SLAB])
+                for start in range(0, slots.numel(), _INDEX_K_DEQUANT_SLAB)
+            ],
+            dim=0,
+        )
+
+    def _dequant_index_k_slab(self, buf: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        """One position slab of `get_index_k_dequant`; see the tiling note above."""
+        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
         # Page layout: see get_index_k_fp4.
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
