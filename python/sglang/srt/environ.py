@@ -1469,7 +1469,11 @@ class Envs:
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
-    SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Thinking is ON by default for this deployment (2026-09-28): the V4.1 template
+    # renders its "Reasoning Effort: N" line inside <think>, and a request can still
+    # opt out per call via chat_template_kwargs={"thinking": false} or a server-wide
+    # SGLANG_DEFAULT_THINKING=0.
+    SGLANG_DEFAULT_THINKING = EnvBool(True)
 
     # ===================================================================
     # Encoder pipeline and disaggregation

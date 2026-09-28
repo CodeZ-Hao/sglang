@@ -65,10 +65,13 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 
+# Anchored to the model's own prompt-format reference (encoding/README.md and
+# encoding.py in the checkpoint): "low" 50, "high" 75, "max" 100, default "high".
+# "xhigh" is this tree's extra alias for the top tier, not a DeepSeek level.
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
-    "low": 25,
-    "high": 50,
-    "xhigh": 75,
+    "low": 50,
+    "high": 75,
+    "xhigh": 100,
     "max": 100,
 }
 DEFAULT_REASONING_EFFORT = "high"
