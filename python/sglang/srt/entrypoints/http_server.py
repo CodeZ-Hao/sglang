@@ -2403,19 +2403,44 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+_FREEZE_GC_PROBE_TIMEOUT_SECS = 60.0
+_FREEZE_GC_PROBE_INTERVAL_SECS = 0.5
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    #
+    # This runs from inside the server process, and with --skip-server-warmup it is
+    # the statement right after the warmup branch, so the request can reach the port
+    # before it is accepting. Probe a cheap endpoint until it answers -- bounded, so a
+    # server that never comes up cannot hold the launch -- then issue the request.
     freeze_key = get_serving().admin_api_key or get_serving().api_key
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    endpoint = server_args.url()
+    ssl_verify = ssl_verify_of(server_args)
+    deadline = time.monotonic() + _FREEZE_GC_PROBE_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        try:
+            probe = requests.get(
+                endpoint + "/get_model_info",
+                headers=freeze_headers,
+                timeout=2,
+                verify=ssl_verify,
+            )
+            if probe.status_code < 400:
+                break
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(_FREEZE_GC_PROBE_INTERVAL_SECS)
     try:
         res = requests.post(
-            server_args.url() + "/freeze_gc",
+            endpoint + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
-            verify=ssl_verify_of(server_args),
+            verify=ssl_verify,
         )
         res.raise_for_status()
     except requests.exceptions.RequestException:
