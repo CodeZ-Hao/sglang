@@ -2845,10 +2845,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
                 toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
+                kwargs = request.chat_template_kwargs or {}
+                if toggle in kwargs:
+                    return kwargs.get(toggle) is True
+                # Mirror the encoder's own default for this toggle (see the
+                # thinking_requested resolution): with a server-wide default of
+                # on, the prompt opens <think> but the parser would never enter
+                # reasoning mode, so the reasoning leaked into content with its
+                # </think> marker still attached.
+                return toggle == "thinking" and envs.SGLANG_DEFAULT_THINKING.get()
             logger.warning(
                 "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
                 mode,

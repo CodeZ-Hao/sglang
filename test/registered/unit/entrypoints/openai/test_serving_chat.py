@@ -4135,19 +4135,37 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertFalse(self.chat._get_reasoning_from_request(req_disabled))
 
-    def test_fallback_explicit_thinking_mode_default_off(self):
+    def test_fallback_explicit_thinking_mirrors_the_encoder_default(self):
+        """The `thinking` toggle's fallback must resolve exactly like the encoder's
+        own default: ``chat_template_kwargs.get("thinking", SGLANG_DEFAULT_THINKING)``.
+
+        Regression: the fallback demanded an explicit ``thinking=True`` while the
+        encoder honoured the server default, so with the default on the prompt
+        opened ``<think>`` and the parser never entered reasoning mode -- the
+        reasoning surfaced in ``content`` with its ``</think>`` marker attached
+        and ``reasoning_tokens`` stayed 0.
+        """
         self._setup_fallback("deepseek-v3")
         req_default = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
-
         req_enabled = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             chat_template_kwargs={"thinking": True},
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+        req_disabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False},
+        )
+
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertTrue(self.chat._get_reasoning_from_request(req_default))
+            self.assertFalse(self.chat._get_reasoning_from_request(req_disabled))
+        with envs.SGLANG_DEFAULT_THINKING.override(False):
+            self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+            self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
     def test_fallback_explicit_enable_thinking_mode_default_off(self):
         self._setup_fallback("mimo")
