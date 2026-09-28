@@ -4802,7 +4802,7 @@ class Scheduler(
 
                 freed = release_workspace_cache()
                 if freed:
-                    logger.info(
+                    logger.debug(
                         "[per-chunk] released %d GiB of cached MoE workspace", freed
                     )
                 if torch.cuda.memory_reserved() / (1 << 30) > 30.0:

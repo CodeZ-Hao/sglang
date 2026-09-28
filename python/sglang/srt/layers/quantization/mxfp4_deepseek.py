@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     is_flashinfer_available,
-    log_info_on_rank0,
+    log_debug_on_rank0,
     set_weight_attrs,
 )
 from sglang.srt.utils.common import next_power_of_2
@@ -356,7 +356,7 @@ class DeepSeekMxfp4MoEMethod:
             w2_raw = layer.w2_weight.data
             hidden_size = w13_raw.shape[2] * 2
             intermediate_size = w2_raw.shape[2] * 2
-            log_info_on_rank0(
+            log_debug_on_rank0(
                 logger,
                 f"[v4-marlin] Preparing native MXFP4 weights "
                 f"(layer: {self.prefix}, capability={_capability}, "
@@ -413,7 +413,7 @@ class DeepSeekMxfp4MoEMethod:
 
             hidden_size_tk = w13_raw.shape[2] * 2
             intermediate_size_tk = w2_raw.shape[2] * 2
-            log_info_on_rank0(
+            log_debug_on_rank0(
                 logger,
                 f"[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs "
                 f"(layer: {self.prefix}, hidden_size={hidden_size_tk}, "
@@ -466,7 +466,7 @@ class DeepSeekMxfp4MoEMethod:
         layer.w13_weight = Parameter(w13_w, requires_grad=False)
         layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
 
-        log_info_on_rank0(
+        log_debug_on_rank0(
             logger,
             f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
             f"(layer: {self.prefix})...",

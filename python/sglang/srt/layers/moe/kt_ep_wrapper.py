@@ -5397,9 +5397,10 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 layer_idx >= first_k_dense_replace
                 and layer_idx % moe_layer_freq == 0
             )
-            # Only log for actual MoE layers
+            # Debug level only: the summary line below already reports the total, so one
+            # line per MoE layer is boot noise in a production log.
             if is_moe_layer:
-                logger.info(
+                logger.debug(
                     "KT GPU experts: layer %d (MoE) has %d GPU experts",
                     layer_idx,
                     int(num_gpu),
@@ -5439,7 +5440,7 @@ def _select_kt_gpu_experts_mask(
     """
     if num_experts is None or masks.shape[1] == num_experts:
         return masks[layer_idx]
-    logger.info(
+    logger.debug(
         "[kt-mask] layer %d has %d experts but the placement table describes %d; "
         "keeping all %d of them on CPU.",
         layer_idx,
