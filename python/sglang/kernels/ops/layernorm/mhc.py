@@ -3,7 +3,7 @@ import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -1252,13 +1252,23 @@ def mhc_post(
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Post-combine for the mHC residual stream.
+
+    ``out`` may alias ``residual``: the kernel processes one row per program and
+    loads its ``b`` tile (the residual) into shared memory before storing the
+    output tile, so writing through is exact -- and the caller is expected to
+    drop its own reference to the old residual, since the result *replaces* it.
+    Aliasing removes one [T, hc_mult, hidden] bf16 buffer (1.25 GiB at T=32768).
+    """
     if is_dsa_prefill_cp_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
-    out = torch.empty_like(residual)
+    if out is None:
+        out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
         residual,

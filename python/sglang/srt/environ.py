@@ -1562,6 +1562,13 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # Write the mHC post-combine through the residual buffer instead of a fresh
+    # [T, hc_mult, hidden] allocation.  Every caller in deepseek_v4.py does
+    # `residual = hc_post(...)` immediately, and the tilelang kernel copies its
+    # `b` tile into shared memory before storing the output tile, so aliasing is
+    # exact (measured bit-identical at T=16384/32768).  Saves one 1.25 GiB
+    # [T, 4, 5120] bf16 buffer per live copy at chunk 32768.
+    SGLANG_OPT_MHC_POST_INPLACE = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

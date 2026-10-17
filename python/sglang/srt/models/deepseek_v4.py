@@ -3073,7 +3073,21 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             from sglang.kernels.ops.layernorm.mhc import mhc_post
 
-            return mhc_post(x, residual, post, comb)
+            # Write through the residual buffer when we can.  Every caller of
+            # this method immediately rebinds its `residual` to the result, so
+            # the incoming buffer is dead on return and the kernel -- which
+            # loads its residual tile into shared memory before storing the
+            # output tile -- can safely alias it.  This is one [T, hc_mult,
+            # hidden] bf16 buffer per live copy (1.25 GiB at T=32768), which is
+            # exactly what the chunk-32768 layerwise prefill is short of.
+            out = (
+                residual
+                if envs.SGLANG_OPT_MHC_POST_INPLACE.get()
+                and residual.is_contiguous()
+                and residual.dtype == x.dtype == torch.bfloat16
+                else None
+            )
+            return mhc_post(x, residual, post, comb, out=out)
 
         elif _is_hip:
             from aiter.ops.mhc import mhc_post
